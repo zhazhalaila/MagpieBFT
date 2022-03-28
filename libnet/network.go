@@ -2,7 +2,6 @@ package libnet
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -24,12 +23,12 @@ type Network struct {
 }
 
 // Create network.
-func MakeNetwork(port string, logger *log.Logger, consumeCh chan message.ReqMsg, releaseCh chan bool) *Network {
+func MakeNetwork(port string, logger *log.Logger, consumeCh chan message.ReqMsg, stopCh, releaseCh chan bool) *Network {
 	rn := &Network{}
 	rn.port = port
 	rn.logger = logger
-	rn.stopCh = make(chan bool)
 	rn.consumeCh = consumeCh
+	rn.stopCh = stopCh
 	rn.releaseCh = releaseCh
 	rn.conns = make(map[string]net.Conn)
 	return rn
@@ -69,8 +68,6 @@ func (rn *Network) Start() {
 func (rn *Network) Shutdown() {
 	close(rn.stopCh)
 	rn.listener.Close()
-	fmt.Println("close consume channnel")
-	close(rn.consumeCh)
 	// Wait for all goroutine done (create by consensus module)
 	<-rn.releaseCh
 }
@@ -98,7 +95,12 @@ func (rn *Network) handleConn(conn net.Conn) {
 			rn.logger.Println(err)
 			break
 		}
+
 		// send data to channel.
-		rn.consumeCh <- req
+		select {
+		case <-rn.stopCh:
+			return
+		case rn.consumeCh <- req:
+		}
 	}
 }

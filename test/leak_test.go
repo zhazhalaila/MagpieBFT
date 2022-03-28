@@ -3,7 +3,6 @@ package test
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"os"
@@ -24,15 +23,16 @@ func TestLeakGoroutine(t *testing.T) {
 	logger := log.New(&b, "logger: ", log.Ldate|log.Ltime|log.Lshortfile)
 	logger.Print("Start server.")
 
-	// Create consume and release channel
+	// Create consume, stopCh and release channel
 	consumeCh := make(chan message.ReqMsg, 100*100)
+	stopCh := make(chan bool)
 	releaseCh := make(chan bool)
-	server := libnet.MakeNetwork(":8000", logger, consumeCh, releaseCh)
+	server := libnet.MakeNetwork(":8000", logger, consumeCh, stopCh, releaseCh)
 	go server.Start()
 
 	// Create consensus module
-	cm := consensus.MakeConsensusModule(consumeCh, releaseCh)
-	go cm.Run()
+	cm := consensus.MakeConsensusModule(releaseCh)
+	go cm.Consume(consumeCh, stopCh)
 
 	// Wait for server start listen
 	time.Sleep(1 * time.Second)
@@ -45,10 +45,13 @@ func TestLeakGoroutine(t *testing.T) {
 	}
 
 	// send msg
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 50; i++ {
 		msg := message.ReqMsg{
 			Sender: i,
 			Round:  i,
+			WprbcReqField: &message.WprbcReq{
+				Req: i,
+			},
 		}
 		msgJs, err := json.Marshal(msg)
 		if err != nil {
@@ -59,7 +62,6 @@ func TestLeakGoroutine(t *testing.T) {
 
 	// close connection.
 	conn.Close()
-	fmt.Println("Close")
 
 	// network shutdown
 	server.Shutdown()

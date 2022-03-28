@@ -28,16 +28,17 @@ func main() {
 	logger := log.New(logFile, "logger: ", log.Ldate|log.Ltime|log.Lshortfile)
 	logger.Print("Start server.")
 
-	// Create consume and release channel
+	// Create consume. stopCh and release channel
 	consumeCh := make(chan message.ReqMsg, 100*100)
+	stopCh := make(chan bool)
 	releaseCh := make(chan bool)
 
 	// Create network.
-	rn := libnet.MakeNetwork(*port, logger, consumeCh, releaseCh)
+	rn := libnet.MakeNetwork(*port, logger, consumeCh, stopCh, releaseCh)
 
 	// Create consensus module.
-	cm := consensus.MakeConsensusModule(consumeCh, releaseCh)
-	go cm.Run()
+	cm := consensus.MakeConsensusModule(releaseCh)
+	go cm.Consume(consumeCh, stopCh)
 
 	// Start server.
 	rn.Start()
