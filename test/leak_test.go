@@ -16,7 +16,7 @@ import (
 )
 
 func TestLeakGoroutine(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1100*time.Millisecond)()
 
 	// Config logger.
 	var b bytes.Buffer
@@ -45,7 +45,7 @@ func TestLeakGoroutine(t *testing.T) {
 	}
 
 	// send msg
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 10000; i++ {
 		msg := message.ReqMsg{
 			Sender: i,
 			Round:  i,

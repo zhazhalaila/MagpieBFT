@@ -1,46 +1,45 @@
 package consensus
 
 import (
-	"sync"
-
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
 type ACS struct {
-	// Wg synchronous wait, assign to it's child module.
 	// Acs channel to read data from consensus module.
 	// Stop channel to exit acs.
-	// Exit channel to exit from for loop goroutine. e.g. monitor goroutine.
-	wg     *sync.WaitGroup
+	// Done channel to notify consensus.
 	acsCh  chan message.ReqMsg
 	stopCh chan bool
-	exitCh chan bool
+	doneCh chan bool
 	// Child module. e.g. wprbc protocol, pb protocol, elect protocol and aba protocol...
 	wp *WPRBC
 }
 
-func MakeAcs(wg *sync.WaitGroup, exitCh chan bool) *ACS {
+func MakeAcs() *ACS {
 	acs := &ACS{}
-	acs.wg = wg
 	acs.acsCh = make(chan message.ReqMsg)
 	acs.stopCh = make(chan bool)
-	acs.exitCh = exitCh
-	acs.wp = MakeWprbc(wg)
+	acs.doneCh = make(chan bool)
+	acs.wp = MakeWprbc()
 	go acs.run()
-	go acs.monitor()
 	return acs
 }
 
 func (acs *ACS) run() {
+L:
 	for {
 		select {
 		case <-acs.stopCh:
 			acs.wp.Stop()
-			return
+			break L
 		case msg := <-acs.acsCh:
 			acs.handlemsg(msg)
+		case <-acs.wp.Output():
 		}
 	}
+
+	<-acs.wp.Done()
+	acs.doneCh <- true
 }
 
 func (acs *ACS) handlemsg(msg message.ReqMsg) {
@@ -49,15 +48,9 @@ func (acs *ACS) handlemsg(msg message.ReqMsg) {
 	}
 }
 
-func (acs *ACS) monitor() {
-	for {
-		select {
-		case <-acs.exitCh:
-			return
-		case <-acs.wp.Output():
-			// fmt.Println("Receive data from wprbc")
-		}
-	}
+// Send data to acs channel
+func (acs *ACS) InputValue(msg message.ReqMsg) {
+	acs.acsCh <- msg
 }
 
 // Close acs channel
@@ -65,7 +58,7 @@ func (acs *ACS) Stop() {
 	close(acs.stopCh)
 }
 
-// Send data to acs channel
-func (acs *ACS) InputValue(msg message.ReqMsg) {
-	acs.acsCh <- msg
+// Done channel
+func (acs *ACS) Done() <-chan bool {
+	return acs.doneCh
 }
