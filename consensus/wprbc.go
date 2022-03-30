@@ -10,23 +10,20 @@ type WPRBC struct {
 	// WaitGroup to wait for all goroutine done
 	// Wprbc channel to read data from acs
 	// Stop channel exit wprbc
-	// RBC channnel to notify acs rbc done
-	// Wp channel to notify wprbc done
+	// Event channel to nptify acs
 	// Done channel to notify acs
-	wg      sync.WaitGroup
-	wprbcCh chan *message.WprbcReq
-	stopCh  chan bool
-	rbcCh   chan []byte
-	wpCh    chan []byte
-	done    chan bool
+	wg       sync.WaitGroup
+	wprbcCh  chan *message.WprbcReq
+	stopCh   chan bool
+	acsEvent chan ACSEvent
+	done     chan bool
 }
 
-func MakeWprbc() *WPRBC {
+func MakeWprbc(acsEvent chan ACSEvent) *WPRBC {
 	wp := &WPRBC{}
-	wp.wprbcCh = make(chan *message.WprbcReq)
+	wp.wprbcCh = make(chan *message.WprbcReq, 100)
 	wp.stopCh = make(chan bool)
-	wp.rbcCh = make(chan []byte)
-	wp.wpCh = make(chan []byte)
+	wp.acsEvent = acsEvent
 	wp.done = make(chan bool)
 	go wp.run()
 	return wp
@@ -40,7 +37,7 @@ L:
 			break L
 		case msg := <-wp.wprbcCh:
 			wp.wg.Add(1)
-			go wp.outputWp(msg)
+			go wp.outputRBC(msg)
 		}
 	}
 
@@ -48,7 +45,7 @@ L:
 	wp.done <- true
 }
 
-func (wp *WPRBC) outputWp(msg *message.WprbcReq) {
+func (wp *WPRBC) outputRBC(msg *message.WprbcReq) {
 	defer func() {
 		wp.wg.Done()
 	}()
@@ -57,7 +54,7 @@ func (wp *WPRBC) outputWp(msg *message.WprbcReq) {
 		select {
 		case <-wp.stopCh:
 			return
-		case wp.wpCh <- []byte("Hello"):
+		case wp.acsEvent <- ACSEvent{status: message.RBCOUTPUT, leader: 2, rbcOut: []byte("hello")}:
 		}
 	}
 }
@@ -65,11 +62,6 @@ func (wp *WPRBC) outputWp(msg *message.WprbcReq) {
 // Send data to wprbc channel
 func (wp *WPRBC) InputValue(msg *message.WprbcReq) {
 	wp.wprbcCh <- msg
-}
-
-// Output wprbc channel
-func (wp *WPRBC) Output() <-chan []byte {
-	return wp.wpCh
 }
 
 // Close wprbc channel

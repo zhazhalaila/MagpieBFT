@@ -24,7 +24,7 @@ func TestLeakGoroutine(t *testing.T) {
 	logger.Print("Start server.")
 
 	// Create consume, stopCh and release channel
-	consumeCh := make(chan message.ReqMsg, 100*100)
+	consumeCh := make(chan *message.ConsensusMsg, 100*100)
 	stopCh := make(chan bool)
 	releaseCh := make(chan bool)
 	server := libnet.MakeNetwork(":8000", logger, consumeCh, stopCh, releaseCh)
@@ -47,10 +47,13 @@ func TestLeakGoroutine(t *testing.T) {
 	// send msg
 	for i := 0; i < 10000; i++ {
 		msg := message.ReqMsg{
-			Sender: i,
-			Round:  i,
-			WprbcReqField: &message.WprbcReq{
-				Req: i,
+			ConsensusMsgField: &message.ConsensusMsg{
+				Round:  i,
+				Sender: i,
+				WprbcReqField: &message.WprbcReq{
+					Leader: 2,
+					Req:    i,
+				},
 			},
 		}
 		msgJs, err := json.Marshal(msg)

@@ -1,7 +1,13 @@
 package message
 
 type ReqMsg struct {
-	Sender        int
-	Round         int
-	WprbcReqField *WprbcReq
+	// Request message wrapper
+	NetworkMangeField *NetworkMange
+	ConfigField       *Config
+	ConsensusMsgField *ConsensusMsg
+}
+
+type ResMsg struct {
+	// Response message
+	ResponseField ClientRes
 }

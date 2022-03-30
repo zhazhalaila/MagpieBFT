@@ -11,26 +11,42 @@ import (
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
+const (
+	PeerOP   = iota
+	ClientOP = iota
+)
+
 type Network struct {
-	logger    *log.Logger         // Global log.
-	mu        sync.RWMutex        // RWLock to prevent race condition.
-	port      string              // Network port.
-	listener  net.Listener        // Network listener.
-	stopCh    chan bool           // Stop server.
-	consumeCh chan message.ReqMsg // Upon receive msg from network send msg to channel.
-	releaseCh chan bool           // Consensus module release.
-	conns     map[string]net.Conn // Cache all remote connection. e.g. {'RemoteAddr': net.conn}.
+	// RWMutex to prevent data race
+	mu sync.RWMutex
+	// Record connected clients
+	// Remote peers
+	clients map[int]net.Conn
+	peers   map[int]net.Conn
+	// Global log
+	// Network port
+	// Network listener
+	logger   *log.Logger
+	port     string
+	listener net.Listener
+	// Stop channel to stop network
+	// Consume channel send data to consensus module
+	// Release channel to exit goroutine upon receive release signal from consensus
+	stopCh    chan bool
+	consumeCh chan *message.ConsensusMsg
+	releaseCh chan bool
 }
 
 // Create network.
-func MakeNetwork(port string, logger *log.Logger, consumeCh chan message.ReqMsg, stopCh, releaseCh chan bool) *Network {
+func MakeNetwork(port string, logger *log.Logger, consumeCh chan *message.ConsensusMsg, stopCh, releaseCh chan bool) *Network {
 	rn := &Network{}
+	rn.clients = make(map[int]net.Conn)
+	rn.peers = make(map[int]net.Conn)
 	rn.port = port
 	rn.logger = logger
 	rn.consumeCh = consumeCh
 	rn.stopCh = stopCh
 	rn.releaseCh = releaseCh
-	rn.conns = make(map[string]net.Conn)
 	return rn
 }
 
@@ -56,10 +72,6 @@ func (rn *Network) Start() {
 				rn.logger.Fatal("accept error:", err)
 			}
 		}
-		// Store connection
-		rn.mu.Lock()
-		rn.conns[conn.RemoteAddr().String()] = conn
-		rn.mu.Unlock()
 		go rn.handleConn(conn)
 	}
 }
@@ -77,9 +89,6 @@ func (rn *Network) handleConn(conn net.Conn) {
 	defer func() {
 		// delete connection from network and close connection.
 		rn.logger.Printf("Remote machine [%s] close connection.\n", conn.RemoteAddr().String())
-		rn.mu.Lock()
-		delete(rn.conns, conn.RemoteAddr().String())
-		rn.mu.Unlock()
 		conn.Close()
 	}()
 
@@ -96,11 +105,143 @@ func (rn *Network) handleConn(conn net.Conn) {
 			break
 		}
 
-		// send data to channel.
+		// Catch stop signal
 		select {
 		case <-rn.stopCh:
 			return
-		case rn.consumeCh <- req:
+		default:
 		}
+
+		if req.NetworkMangeField != nil {
+			rn.networkMange(req.NetworkMangeField, conn)
+		}
+
+		if req.ConsensusMsgField != nil {
+			rn.consumeCh <- req.ConsensusMsgField
+		}
+	}
+}
+
+func (rn *Network) networkMange(msg *message.NetworkMange, connnectedConn net.Conn) {
+	if msg.ConnPeerField != nil || msg.SetClientField != nil {
+		rn.connect(msg, connnectedConn)
+		return
+	}
+
+	if msg.DisConnPeerField != nil || msg.DisconnectClientField != nil {
+		rn.disconnectPeer(msg)
+		return
+	}
+
+	rn.logger.Printf("Unkonwn [%v] type of network manage.\n", msg)
+}
+
+// Connect to other network
+func (rn *Network) connect(msg *message.NetworkMange, connectedConn net.Conn) {
+	var op int
+	var id int
+
+	// Get operation type and remote connect identify
+	if msg.ConnPeerField != nil {
+		id = msg.ConnPeerField.PeerId
+		op = PeerOP
+	} else if msg.SetClientField != nil {
+		id = msg.SetClientField.ClientId
+		op = ClientOP
+	} else {
+		return
+	}
+
+	// If connected, return
+	_, ok := rn.readMap(id, op)
+	if ok {
+		if op == PeerOP {
+			rn.logger.Printf("[Peer:%d] has been connected.\n", id)
+			return
+		} else {
+			rn.logger.Printf("[Client:%d] has been connected.\n", id)
+			return
+		}
+	}
+
+	// Create connection
+	if op == PeerOP {
+		conn, err := net.Dial("tcp", msg.ConnPeerField.PeerAddr)
+		if err != nil {
+			rn.logger.Printf("Connect to [Peer:%d] fail.\n", id)
+			return
+		}
+		rn.writeMap(id, PeerOP, conn)
+	}
+
+	// Reuse connected connection
+	if op == ClientOP {
+		rn.writeMap(id, ClientOP, connectedConn)
+	}
+}
+
+// Disconnect from other network
+func (rn *Network) disconnectPeer(msg *message.NetworkMange) {
+	var op int
+	var id int
+
+	if msg.DisConnPeerField != nil {
+		op = PeerOP
+		id = msg.DisConnPeerField.PeerId
+	} else if msg.DisconnectClientField != nil {
+		op = ClientOP
+		id = msg.DisconnectClientField.ClientId
+	} else {
+		return
+	}
+
+	// Map delete is no-op if map is nil or key doesn't exist
+	rn.deleteMap(id, op)
+}
+
+// Get data from map
+func (rn *Network) readMap(id, op int) (net.Conn, bool) {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+
+	switch op {
+	case PeerOP:
+		if peer, ok := rn.peers[id]; ok {
+			return peer, ok
+		}
+	case ClientOP:
+		if client, ok := rn.clients[id]; ok {
+			return client, ok
+		}
+	}
+	return nil, false
+}
+
+// Set data to map
+func (rn *Network) writeMap(id, op int, conn net.Conn) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	switch op {
+	case PeerOP:
+		rn.peers[id] = conn
+	case ClientOP:
+		rn.clients[id] = conn
+	}
+}
+
+// Delete data from map
+func (rn *Network) deleteMap(id, op int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// Close connection and delete connection from map
+	switch op {
+	case PeerOP:
+		rn.peers[id].Close()
+		delete(rn.peers, id)
+	case ClientOP:
+		rn.clients[id].Close()
+		delete(rn.clients, id)
 	}
 }

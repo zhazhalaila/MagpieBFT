@@ -11,7 +11,7 @@ type ConsensusModule struct {
 	// Consume channel to read data from network.
 	// Stop channel to stop read data from network.
 	// Release channel to notify network exit.
-	consumeCh chan message.ReqMsg
+	consumeCh chan *message.ConsensusMsg
 	stopCh    chan bool
 	releaseCh chan bool
 }
@@ -23,7 +23,7 @@ func MakeConsensusModule(releaseCh chan bool) *ConsensusModule {
 	return cm
 }
 
-func (cm *ConsensusModule) Consume(consumeCh chan message.ReqMsg, stopCh chan bool) {
+func (cm *ConsensusModule) Consume(consumeCh chan *message.ConsensusMsg, stopCh chan bool) {
 	cm.consumeCh = consumeCh
 	cm.stopCh = stopCh
 

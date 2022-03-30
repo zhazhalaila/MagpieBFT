@@ -29,7 +29,7 @@ func main() {
 	logger.Print("Start server.")
 
 	// Create consume. stopCh and release channel
-	consumeCh := make(chan message.ReqMsg, 100*100)
+	consumeCh := make(chan *message.ConsensusMsg, 100*100)
 	stopCh := make(chan bool)
 	releaseCh := make(chan bool)
 
