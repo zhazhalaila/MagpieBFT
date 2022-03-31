@@ -6,3 +6,14 @@ type ConsensusMsg struct {
 	Round         int
 	WprbcReqField *WprbcReq
 }
+
+// Consensus message generator
+func GenConsensusMsg(sender, round int) ReqMsg {
+	msg := ReqMsg{
+		ConsensusMsgField: &ConsensusMsg{
+			Sender: sender,
+			Round:  round,
+		},
+	}
+	return msg
+}

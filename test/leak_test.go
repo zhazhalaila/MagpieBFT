@@ -51,8 +51,8 @@ func TestLeakGoroutine(t *testing.T) {
 				Round:  i,
 				Sender: i,
 				WprbcReqField: &message.WprbcReq{
-					Leader: 2,
-					Req:    i,
+					Proposer: 2,
+					Req:      i,
 				},
 			},
 		}

@@ -2,6 +2,7 @@ package libnet
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -11,18 +12,26 @@ import (
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
-const (
-	PeerOP   = iota
-	ClientOP = iota
-)
+type countRead struct {
+	conn  net.Conn
+	count int64
+}
+
+func (cr *countRead) Read(p []byte) (n int, err error) {
+	n, err = cr.conn.Read(p)
+	cr.count += int64(n)
+	return
+}
 
 type Network struct {
 	// RWMutex to prevent data race
 	mu sync.RWMutex
+	// Total read bytes
 	// Record connected clients
 	// Remote peers
-	clients map[int]net.Conn
-	peers   map[int]net.Conn
+	readBytes int64
+	clients   map[int]net.Conn
+	peers     map[int]net.Conn
 	// Global log
 	// Network port
 	// Network listener
@@ -82,17 +91,86 @@ func (rn *Network) Shutdown() {
 	rn.listener.Close()
 	// Wait for all goroutine done (create by consensus module)
 	<-rn.releaseCh
+
+	fmt.Printf("Read total [%d] bytes.\n", rn.readBytes)
+	fmt.Printf("Read total [%f] MB.\n", float64(rn.readBytes)/(1<<20))
+}
+
+func (rn *Network) Broadcast(msg message.ReqMsg) {
+	rn.mu.RLock()
+	peers := rn.peers
+	rn.mu.RUnlock()
+
+	// Broadcast message
+	for peerId := range peers {
+		rn.SendToPeer(peerId, msg)
+	}
+}
+
+func (rn *Network) SendToPeer(peerId int, msg message.ReqMsg) {
+
+	rn.mu.RLock()
+	peer, ok := rn.peers[peerId]
+	rn.mu.RUnlock()
+
+	if !ok {
+		rn.logger.Printf("[Peer:%d] disconnect.\n", peerId)
+		return
+	}
+
+	// Message marshal
+	msgEncoded, err := json.Marshal(msg)
+	if err != nil {
+		rn.logger.Printf(err.Error())
+		return
+	}
+
+	_, err = peer.Write(msgEncoded)
+	if err != nil {
+		rn.logger.Printf("Send msg to [Peer:%d] error.\n", peerId)
+		rn.logger.Printf(err.Error())
+	}
+}
+
+func (rn *Network) ClientResponse(clientId int, msg message.ResMsg) {
+	rn.mu.RLock()
+	client, ok := rn.clients[clientId]
+	rn.mu.RUnlock()
+
+	if !ok {
+		rn.logger.Printf("[Client:%d] has been diconnected.\n", clientId)
+		return
+	}
+
+	// Message marshal
+	msgEncoded, err := json.Marshal(msg)
+	if err != nil {
+		rn.logger.Printf(err.Error())
+		return
+	}
+
+	_, err = client.Write(msgEncoded)
+	if err != nil {
+		rn.logger.Printf("Send msg to [Client:%d] error.\n", clientId)
+		rn.logger.Printf(err.Error())
+	}
 }
 
 // Handle connection
 func (rn *Network) handleConn(conn net.Conn) {
+	// read count
+	cr := &countRead{conn: conn, count: 0}
+
 	defer func() {
 		// delete connection from network and close connection.
 		rn.logger.Printf("Remote machine [%s] close connection.\n", conn.RemoteAddr().String())
+		rn.mu.Lock()
+		rn.readBytes += cr.count
+		rn.mu.Unlock()
 		conn.Close()
 	}()
 
-	dec := json.NewDecoder(conn)
+	dec := json.NewDecoder(cr)
 
 	for {
 		var req message.ReqMsg
@@ -123,125 +201,91 @@ func (rn *Network) handleConn(conn net.Conn) {
 }
 
 func (rn *Network) networkMange(msg *message.NetworkMange, connnectedConn net.Conn) {
-	if msg.ConnPeerField != nil || msg.SetClientField != nil {
-		rn.connect(msg, connnectedConn)
+	if msg.ConnPeerField != nil {
+		rn.connectPeer(*msg.ConnPeerField)
 		return
 	}
 
-	if msg.DisConnPeerField != nil || msg.DisconnectClientField != nil {
-		rn.disconnectPeer(msg)
+	if msg.SetClientField != nil {
+		rn.recordClient(*msg.SetClientField, connnectedConn)
+		return
+	}
+
+	if msg.DisConnPeerField != nil {
+		rn.disconnectPeer(*msg.DisConnPeerField)
+		return
+	}
+
+	if msg.DisconnectClientField != nil {
+		rn.deleteClient(*msg.DisconnectClientField)
 		return
 	}
 
 	rn.logger.Printf("Unkonwn [%v] type of network manage.\n", msg)
 }
 
-// Connect to other network
-func (rn *Network) connect(msg *message.NetworkMange, connectedConn net.Conn) {
-	var op int
-	var id int
-
-	// Get operation type and remote connect identify
-	if msg.ConnPeerField != nil {
-		id = msg.ConnPeerField.PeerId
-		op = PeerOP
-	} else if msg.SetClientField != nil {
-		id = msg.SetClientField.ClientId
-		op = ClientOP
-	} else {
-		return
-	}
-
-	// If connected, return
-	_, ok := rn.readMap(id, op)
-	if ok {
-		if op == PeerOP {
-			rn.logger.Printf("[Peer:%d] has been connected.\n", id)
-			return
-		} else {
-			rn.logger.Printf("[Client:%d] has been connected.\n", id)
-			return
-		}
-	}
-
-	// Create connection
-	if op == PeerOP {
-		conn, err := net.Dial("tcp", msg.ConnPeerField.PeerAddr)
-		if err != nil {
-			rn.logger.Printf("Connect to [Peer:%d] fail.\n", id)
-			return
-		}
-		rn.writeMap(id, PeerOP, conn)
-	}
-
-	// Reuse connected connection
-	if op == ClientOP {
-		rn.writeMap(id, ClientOP, connectedConn)
-	}
-}
-
-// Disconnect from other network
-func (rn *Network) disconnectPeer(msg *message.NetworkMange) {
-	var op int
-	var id int
-
-	if msg.DisConnPeerField != nil {
-		op = PeerOP
-		id = msg.DisConnPeerField.PeerId
-	} else if msg.DisconnectClientField != nil {
-		op = ClientOP
-		id = msg.DisconnectClientField.ClientId
-	} else {
-		return
-	}
-
-	// Map delete is no-op if map is nil or key doesn't exist
-	rn.deleteMap(id, op)
-}
-
-// Get data from map
-func (rn *Network) readMap(id, op int) (net.Conn, bool) {
+func (rn *Network) connectPeer(peerInfo message.ConnectPeer) {
 	rn.mu.RLock()
-	defer rn.mu.RUnlock()
+	_, ok := rn.peers[peerInfo.PeerId]
+	rn.mu.RUnlock()
 
-	switch op {
-	case PeerOP:
-		if peer, ok := rn.peers[id]; ok {
-			return peer, ok
-		}
-	case ClientOP:
-		if client, ok := rn.clients[id]; ok {
-			return client, ok
-		}
+	if ok {
+		rn.logger.Printf("[Peer:%d] has been connected.\n", peerInfo.PeerId)
+		return
 	}
-	return nil, false
+
+	conn, err := net.Dial("tcp", peerInfo.PeerAddr)
+	if err != nil {
+		rn.logger.Printf("Connect to [Peer:%d] fail.\n", peerInfo.PeerId)
+		return
+	} else {
+		rn.logger.Printf("Connect to [Peer:%d] success.\n", peerInfo.PeerId)
+	}
+
+	rn.mu.Lock()
+	rn.peers[peerInfo.PeerId] = conn
+	rn.mu.Unlock()
 }
 
-// Set data to map
-func (rn *Network) writeMap(id, op int, conn net.Conn) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
+func (rn *Network) disconnectPeer(peerInfo message.DisConnectPeer) {
+	rn.mu.RLock()
+	conn, ok := rn.peers[peerInfo.PeerId]
+	rn.mu.RUnlock()
 
-	switch op {
-	case PeerOP:
-		rn.peers[id] = conn
-	case ClientOP:
-		rn.clients[id] = conn
+	if ok {
+		conn.Close()
 	}
+
+	rn.mu.Lock()
+	delete(rn.peers, peerInfo.PeerId)
+	rn.mu.Unlock()
 }
 
-// Delete data from map
-func (rn *Network) deleteMap(id, op int) {
+func (rn *Network) recordClient(clientInfo message.SetClient, connectedConn net.Conn) {
 	rn.mu.Lock()
-	defer rn.mu.Unlock()
+	_, ok := rn.clients[clientInfo.ClientId]
+	rn.mu.RUnlock()
 
-	// Close connection and delete connection from map
-	switch op {
-	case PeerOP:
-		rn.peers[id].Close()
-		delete(rn.peers, id)
-	case ClientOP:
-		rn.clients[id].Close()
-		delete(rn.clients, id)
+	if ok {
+		rn.logger.Printf("[Client:%d] has been connected.\n", clientInfo.ClientId)
+		return
 	}
+
+	rn.mu.Lock()
+	rn.peers[clientInfo.ClientId] = connectedConn
+	rn.mu.Unlock()
+}
+
+func (rn *Network) deleteClient(clientInfo message.DisconnectClient) {
+	rn.mu.RLock()
+	conn, ok := rn.clients[clientInfo.ClientId]
+	rn.mu.RUnlock()
+
+	if ok {
+		conn.Close()
+	}
+
+	rn.mu.Lock()
+	delete(rn.clients, clientInfo.ClientId)
+	rn.mu.Unlock()
 }

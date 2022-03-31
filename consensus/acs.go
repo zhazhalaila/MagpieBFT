@@ -27,7 +27,7 @@ type ACSEvent struct {
 type ACS struct {
 	// Current round
 	round int
-	// ACS channel to read data from consensus module
+	// ACS in channel to read data from consensus module
 	// ACS out channel write data to network
 	// Stop channel to exit acs
 	// Done channel to notify consensus
@@ -85,7 +85,7 @@ L:
 
 func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 	if msg.WprbcReqField != nil {
-		acs.wpInstances[msg.WprbcReqField.Leader].InputValue(msg.WprbcReqField)
+		acs.wpInstances[msg.WprbcReqField.Proposer].InputValue(msg.WprbcReqField)
 	}
 }
 
