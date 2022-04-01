@@ -29,9 +29,13 @@ type PROOF struct {
 
 type WprbcReq struct {
 	// Only proposer can send VAL msg to start wprbc phase
-	Proposer int
-	Req      int
-	VALField *VAL
+	Proposer          int
+	Req               int
+	VALField          *VAL
+	ECHOField         *ECHO
+	READYField        *READY
+	PartialShareField *PartialShare
+	PROOFField        *PROOF
 }
 
 // WPRBC message generator
