@@ -37,7 +37,7 @@ func main() {
 	rn := libnet.MakeNetwork(*port, logger, consumeCh, stopCh, releaseCh)
 
 	// Create consensus module.
-	cm := consensus.MakeConsensusModule(releaseCh)
+	cm := consensus.MakeConsensusModule(logger, rn, releaseCh)
 	go cm.Consume(consumeCh, stopCh)
 
 	// Start server.

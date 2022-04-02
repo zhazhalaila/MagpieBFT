@@ -30,6 +30,7 @@ type PROOF struct {
 type WprbcReq struct {
 	// Only proposer can send VAL msg to start wprbc phase
 	Proposer          int
+	Sender            int
 	Req               int
 	VALField          *VAL
 	ECHOField         *ECHO
@@ -40,9 +41,10 @@ type WprbcReq struct {
 
 // WPRBC message generator
 func GenWPRBCMsg(sender, round, proposer int) ReqMsg {
-	msg := GenConsensusMsg(sender, round)
+	msg := GenConsensusMsg(sender)
 	msg.ConsensusMsgField.WprbcReqField = &WprbcReq{
 		Proposer: proposer,
+		Sender:   sender,
 	}
 	return msg
 }

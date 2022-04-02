@@ -12,6 +12,7 @@ import (
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
+// io.Reader wrapper to count receive bytes
 type countRead struct {
 	conn  net.Conn
 	count int64

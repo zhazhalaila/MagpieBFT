@@ -1,8 +1,13 @@
 package consensus
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
+	"sync"
 
+	"github.com/zhazhalaila/BFTProtocol/libnet"
+	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
@@ -19,6 +24,12 @@ type txWithStatus struct {
 }
 
 type ConsensusModule struct {
+	// Global log
+	logger *log.Logger
+	// Network module
+	network *libnet.Network
+	// WaitGroup wait for start acs goroutine done
+	wg sync.WaitGroup
 	// N = Total peers number, F = Byzantine peers number, ID = current peer identify
 	n  int
 	f  int
@@ -31,7 +42,7 @@ type ConsensusModule struct {
 	buffer       []txWithStatus
 	acsInstances map[int]*ACS
 	// Output channel to receive data from acs
-	outputCh chan [][]byte
+	acsOutCh chan [][]byte
 	// Consume channel to read data from network
 	// Stop channel to stop read data from network
 	// Release channel to notify network exit
@@ -40,10 +51,12 @@ type ConsensusModule struct {
 	releaseCh chan bool
 }
 
-func MakeConsensusModule(releaseCh chan bool) *ConsensusModule {
+func MakeConsensusModule(logger *log.Logger, network *libnet.Network, releaseCh chan bool) *ConsensusModule {
 	cm := &ConsensusModule{}
+	cm.logger = logger
+	cm.network = network
 	cm.buffer = make([]txWithStatus, 65536)
-	cm.outputCh = make(chan [][]byte, 100)
+	cm.acsOutCh = make(chan [][]byte, 100)
 	cm.acsInstances = make(map[int]*ACS)
 	cm.releaseCh = releaseCh
 	return cm
@@ -60,10 +73,10 @@ L:
 			break L
 		case msg := <-cm.consumeCh:
 			if _, ok := cm.acsInstances[msg.Round]; !ok {
-				cm.acsInstances[msg.Round] = MakeAcs(cm.outputCh)
+				cm.acsInstances[msg.Round] = MakeAcs(cm.logger, cm.network, cm.acsOutCh)
 			}
 			cm.acsInstances[msg.Round].InputValue(msg)
-		case <-cm.outputCh:
+		case <-cm.acsOutCh:
 		}
 	}
 
@@ -91,6 +104,43 @@ func (cm *ConsensusModule) consensusMsgHandle(msg *message.ConsensusMsg) {
 		for _, tx := range msg.InputTxField.Transactions {
 			cm.buffer = append(cm.buffer, txWithStatus{status: PROCESS, tx: tx})
 		}
-
 	}
+}
+
+func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
+	// Marshal
+	txsBytes, err := json.Marshal(transactions)
+	if err != nil {
+		// log
+		return
+	}
+	// Erasure code
+	shards, err := ECEncode(cm.f+1, cm.n-(cm.f+1), txsBytes)
+	if err != nil {
+		// log
+		return
+	}
+	// Merkle tree
+	mt, err := merkletree.MakeMerkleTree(shards)
+	if err != nil {
+		// log
+		return
+	}
+	rootHash := mt[1]
+	// Broadcast val msg
+	cm.wg.Add(1)
+	go func() {
+		defer cm.wg.Done()
+
+		for i := 0; i < cm.n; i++ {
+			branch := merkletree.GetMerkleBranch(i, mt)
+			msg := message.GenWPRBCMsg(cm.id, round, cm.id)
+			msg.ConsensusMsgField.WprbcReqField.VALField = &message.VAL{
+				RootHash: rootHash,
+				Branch:   branch,
+				Shard:    shards[i],
+			}
+			cm.network.SendToPeer(i, msg)
+		}
+	}()
 }

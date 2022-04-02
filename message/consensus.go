@@ -10,7 +10,6 @@ type InputTx struct {
 
 type ConsensusMsg struct {
 	// Consensus msg wrapper
-	Sender               int
 	Round                int
 	ConsensusConfigField *ConsensusConfig
 	InputTxField         *InputTx
@@ -18,11 +17,10 @@ type ConsensusMsg struct {
 }
 
 // Consensus message generator
-func GenConsensusMsg(sender, round int) ReqMsg {
+func GenConsensusMsg(round int) ReqMsg {
 	msg := ReqMsg{
 		ConsensusMsgField: &ConsensusMsg{
-			Sender: sender,
-			Round:  round,
+			Round: round,
 		},
 	}
 	return msg

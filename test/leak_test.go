@@ -31,7 +31,7 @@ func TestLeakGoroutine(t *testing.T) {
 	go server.Start()
 
 	// Create consensus module
-	cm := consensus.MakeConsensusModule(releaseCh)
+	cm := consensus.MakeConsensusModule(logger, server, releaseCh)
 	go cm.Consume(consumeCh, stopCh)
 
 	// Wait for server start listen
@@ -48,8 +48,7 @@ func TestLeakGoroutine(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		msg := message.ReqMsg{
 			ConsensusMsgField: &message.ConsensusMsg{
-				Round:  i,
-				Sender: i,
+				Round: i,
 				WprbcReqField: &message.WprbcReq{
 					Proposer: 2,
 					Req:      i,

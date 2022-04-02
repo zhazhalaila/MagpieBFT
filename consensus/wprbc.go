@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"fmt"
+	"log"
 	"sync"
 
 	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
@@ -12,6 +13,8 @@ import (
 )
 
 type WPRBC struct {
+	// Global log
+	logger *log.Logger
 	// Mutex to prevent data race
 	mu sync.Mutex
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
@@ -47,18 +50,19 @@ type WPRBC struct {
 	// Wprbc channel to read data from acs
 	// Stop channel exit wprbc
 	// Event channel to nptify acs
-	// Send data to ACS out channel
+	// Network channel send data to network (manage by acs)
 	// Done channel to notify acs
-	wg       sync.WaitGroup
-	wprbcCh  chan *message.WprbcReq
-	stopCh   chan bool
-	acsEvent chan ACSEvent
-	acsOut   chan ACSOut
-	done     chan bool
+	wg        sync.WaitGroup
+	wprbcCh   chan *message.WprbcReq
+	stopCh    chan bool
+	acsEvent  chan ACSEvent
+	networkCh chan NetworkMsg
+	done      chan bool
 }
 
-func MakeWprbc(acsEvent chan ACSEvent, acsOut chan ACSOut) *WPRBC {
+func MakeWprbc(logger *log.Logger, acsEvent chan ACSEvent, networkCh chan NetworkMsg) *WPRBC {
 	wp := &WPRBC{}
+	wp.logger = logger
 	wp.readySent = false
 	wp.echoSenders = make(map[int]int, 100)
 	wp.shards = make(map[[32]byte]map[int][]byte)
@@ -68,7 +72,7 @@ func MakeWprbc(acsEvent chan ACSEvent, acsOut chan ACSOut) *WPRBC {
 	wp.wprbcCh = make(chan *message.WprbcReq, 100)
 	wp.stopCh = make(chan bool)
 	wp.acsEvent = acsEvent
-	wp.acsOut = acsOut
+	wp.networkCh = networkCh
 	wp.done = make(chan bool)
 	go wp.run()
 	return wp
@@ -82,7 +86,7 @@ L:
 			break L
 		case msg := <-wp.wprbcCh:
 			wp.wg.Add(1)
-			go wp.outputRBC(msg)
+			go wp.handleMsg(msg)
 		}
 	}
 
@@ -90,9 +94,15 @@ L:
 	wp.done <- true
 }
 
+func (wp *WPRBC) handleMsg(msg *message.WprbcReq) {
+	if msg.VALField != nil {
+		wp.handleVAL(msg.VALField, msg.Sender)
+	}
+}
+
 // Check VAL send from proposer not byzantine sender
 // If valid send echo msg to acs output channel
-func (wp *WPRBC) handleVAL(val message.VAL, sender int) {
+func (wp *WPRBC) handleVAL(val *message.VAL, sender int) {
 	defer wp.wg.Done()
 
 	if sender != wp.fromProposer {
@@ -101,6 +111,7 @@ func (wp *WPRBC) handleVAL(val message.VAL, sender int) {
 	}
 
 	if merkletree.MerkleTreeVerify(val.Shard, val.RootHash, val.Branch, wp.id) {
+		wp.logger.Printf("[%d] receive VAL from [%d].\n", wp.id, sender)
 		wp.fromLeader = val.RootHash
 
 		echo := message.GenWPRBCMsg(wp.id, wp.round, wp.fromProposer)
@@ -113,7 +124,7 @@ func (wp *WPRBC) handleVAL(val message.VAL, sender int) {
 		select {
 		case <-wp.stopCh:
 			return
-		case wp.acsOut <- ACSOut{broadcast: true, msg: echo}:
+		case wp.networkCh <- NetworkMsg{broadcast: true, msg: echo}:
 		}
 	}
 }
@@ -121,7 +132,7 @@ func (wp *WPRBC) handleVAL(val message.VAL, sender int) {
 // If receive redundant echo msg, return
 // If receive 2f+1 echo msg and not send ready msg, send msg to acs output channel
 // If receive 2f+1 ready msg and f+1 echo msg, output to acs
-func (wp *WPRBC) handleECHO(echo message.ECHO, sender int) {
+func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 	defer wp.wg.Done()
 
 	wp.mu.Lock()
@@ -159,7 +170,7 @@ func (wp *WPRBC) handleECHO(echo message.ECHO, sender int) {
 // If receive redundant ready msg, return
 // If receive f+1 ready msg and not send ready msg, broadcast ready msg
 // If receive 2f+1 ready msg and f+1 echo msg, output to acs
-func (wp *WPRBC) handleREADY(ready message.READY, sender int) {
+func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 	defer wp.wg.Done()
 
 	wp.mu.Lock()
@@ -194,7 +205,7 @@ func (wp *WPRBC) handleREADY(ready message.READY, sender int) {
 // Only proposer do this
 // If receive redundant share, return
 // If receive 2f+1 valid shares, compute signature
-func (wp *WPRBC) handleShare(share message.PartialShare, sender int) {
+func (wp *WPRBC) handleShare(share *message.PartialShare, sender int) {
 	defer wp.wg.Done()
 
 	rootHashHash, err := verify.ConvertStructToHashBytes(share.RootHash)
@@ -230,7 +241,7 @@ func (wp *WPRBC) handleShare(share message.PartialShare, sender int) {
 }
 
 // If receive valid proof, output to acs
-func (wp *WPRBC) handleProof(proof message.PROOF, sender int) {
+func (wp *WPRBC) handleProof(proof *message.PROOF, sender int) {
 	defer wp.wg.Done()
 
 	rootHashHash, err := verify.ConvertStructToHashBytes(proof.RootHash)
@@ -252,7 +263,7 @@ func (wp *WPRBC) handleProof(proof message.PROOF, sender int) {
 
 // broadcast ready msg
 func (wp *WPRBC) bcReady(rootHash [32]byte) {
-	ready := message.GenConsensusMsg(wp.id, wp.id)
+	ready := message.GenWPRBCMsg(wp.id, wp.round, wp.fromProposer)
 	ready.ConsensusMsgField.WprbcReqField.READYField = &message.READY{
 		RootHash: rootHash,
 	}
@@ -260,7 +271,7 @@ func (wp *WPRBC) bcReady(rootHash [32]byte) {
 	select {
 	case <-wp.stopCh:
 		return
-	case wp.acsOut <- ACSOut{broadcast: true, msg: ready}:
+	case wp.networkCh <- NetworkMsg{broadcast: true, msg: ready}:
 	}
 }
 

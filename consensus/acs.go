@@ -2,12 +2,14 @@ package consensus
 
 import (
 	"fmt"
+	"log"
 	"sync"
 
+	"github.com/zhazhalaila/BFTProtocol/libnet"
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
-type ACSOut struct {
+type NetworkMsg struct {
 	// Write msg to network
 	// Broadcast msg or send msg to peer
 	broadcast bool
@@ -28,40 +30,46 @@ type ACSEvent struct {
 }
 
 type ACS struct {
+	// Global log
+	logger *log.Logger
 	// WaitGroup to wait for all created goroutine(write msg to network) done
 	wg sync.WaitGroup
 	// Current round
 	round int
+	// Network module
+	network *libnet.Network
 	// ACS in channel to read data from consensus module
-	// ACS out channel write data to network
+	// Output channel to consensus
+	// Network channel write data to network
 	// Stop channel to exit acs
 	// Done channel to notify consensus
 	// Child Event channel to receive msg from child module
 	// ACS output txs to consensus
-	acsIn    chan *message.ConsensusMsg
-	acsOut   chan ACSOut
-	stopCh   chan bool
-	doneCh   chan bool
-	acsEvent chan ACSEvent
-	// Output channel to consensus
-	outputCh chan [][]byte
+	acsInCh   chan *message.ConsensusMsg
+	acsOutCh  chan [][]byte
+	networkCh chan NetworkMsg
+	stopCh    chan bool
+	doneCh    chan bool
+	acsEvent  chan ACSEvent
 	// Child module. e.g. wprbc protocol, pb protocol, elect protocol and aba protocol...
 	wpInstances []*WPRBC
 }
 
-func MakeAcs(outputCh chan [][]byte) *ACS {
+func MakeAcs(logger *log.Logger, network *libnet.Network, acsOutCh chan [][]byte) *ACS {
 	acs := &ACS{}
-	acs.acsIn = make(chan *message.ConsensusMsg, 100)
-	acs.acsOut = make(chan ACSOut, 100)
+	acs.logger = logger
+	acs.network = network
+	acs.acsInCh = make(chan *message.ConsensusMsg, 100)
+	acs.networkCh = make(chan NetworkMsg, 100)
 	acs.stopCh = make(chan bool)
 	acs.doneCh = make(chan bool)
 	acs.acsEvent = make(chan ACSEvent, 100)
-	acs.outputCh = outputCh
+	acs.acsOutCh = acsOutCh
 	acs.wpInstances = make([]*WPRBC, 10)
 
 	// Init wprbc instances
 	for i := 0; i < len(acs.wpInstances); i++ {
-		acs.wpInstances[i] = MakeWprbc(acs.acsEvent, acs.acsOut)
+		acs.wpInstances[i] = MakeWprbc(acs.logger, acs.acsEvent, acs.networkCh)
 	}
 
 	go acs.run()
@@ -77,11 +85,11 @@ L:
 				acs.wpInstances[i].Stop()
 			}
 			break L
-		case msg := <-acs.acsIn:
+		case msg := <-acs.acsInCh:
 			acs.handlemsg(msg)
 		case <-acs.acsEvent:
 			// fmt.Println(msg)
-		case reqMsg := <-acs.acsOut:
+		case reqMsg := <-acs.networkCh:
 			fmt.Println(reqMsg)
 		}
 	}
@@ -104,13 +112,13 @@ func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 func (acs *ACS) output(results [][]byte) {
 	select {
 	case <-acs.stopCh:
-	case acs.outputCh <- results:
+	case acs.acsOutCh <- results:
 	}
 }
 
 // Send data to acs channel
 func (acs *ACS) InputValue(msg *message.ConsensusMsg) {
-	acs.acsIn <- msg
+	acs.acsInCh <- msg
 }
 
 // Close acs channel
