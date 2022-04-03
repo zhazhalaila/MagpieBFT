@@ -41,7 +41,7 @@ type WprbcReq struct {
 
 // WPRBC message generator
 func GenWPRBCMsg(sender, round, proposer int) ReqMsg {
-	msg := GenConsensusMsg(sender)
+	msg := GenConsensusMsg(round)
 	msg.ConsensusMsgField.WprbcReqField = &WprbcReq{
 		Proposer: proposer,
 		Sender:   sender,

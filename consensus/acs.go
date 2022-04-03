@@ -1,12 +1,13 @@
 package consensus
 
 import (
-	"fmt"
 	"log"
 	"sync"
 
 	"github.com/zhazhalaila/BFTProtocol/libnet"
 	"github.com/zhazhalaila/BFTProtocol/message"
+	"go.dedis.ch/kyber/v3/pairing/bn256"
+	"go.dedis.ch/kyber/v3/share"
 )
 
 type NetworkMsg struct {
@@ -22,9 +23,10 @@ type ACSEvent struct {
 	// Once child module done. e.g. rbc output | ba output ... notify acs
 	// Common leader was elected from elect phase
 	status       int
-	leader       int
+	instanceId   int
 	rbcOut       []byte
 	wprbcOut     []byte
+	pbOut        map[int]message.PROOF
 	commonLeader int
 	baOut        int
 }
@@ -32,12 +34,19 @@ type ACSEvent struct {
 type ACS struct {
 	// Global log
 	logger *log.Logger
-	// WaitGroup to wait for all created goroutine(write msg to network) done
-	wg sync.WaitGroup
-	// Current round
-	round int
 	// Network module
 	network *libnet.Network
+	// WaitGroup to wait for all created goroutine(write msg to network) done
+	wg sync.WaitGroup
+	n  int
+	f  int
+	id int
+	// Current round
+	round int
+	// Used to crypto
+	suite  *bn256.Suite
+	pubKey *share.PubPoly
+	priKey *share.PriShare
 	// ACS in channel to read data from consensus module
 	// Output channel to consensus
 	// Network channel write data to network
@@ -55,10 +64,23 @@ type ACS struct {
 	wpInstances []*WPRBC
 }
 
-func MakeAcs(logger *log.Logger, network *libnet.Network, acsOutCh chan [][]byte) *ACS {
+func MakeAcs(logger *log.Logger,
+	network *libnet.Network,
+	n, f, id, round int,
+	suite *bn256.Suite,
+	pubKey *share.PubPoly,
+	priKey *share.PriShare,
+	acsOutCh chan [][]byte) *ACS {
 	acs := &ACS{}
 	acs.logger = logger
 	acs.network = network
+	acs.n = n
+	acs.f = f
+	acs.id = id
+	acs.round = round
+	acs.suite = suite
+	acs.pubKey = pubKey
+	acs.priKey = priKey
 	acs.acsInCh = make(chan *message.ConsensusMsg, 100)
 	acs.networkCh = make(chan NetworkMsg, 100)
 	acs.stopCh = make(chan bool)
@@ -68,8 +90,10 @@ func MakeAcs(logger *log.Logger, network *libnet.Network, acsOutCh chan [][]byte
 	acs.wpInstances = make([]*WPRBC, 10)
 
 	// Init wprbc instances
-	for i := 0; i < len(acs.wpInstances); i++ {
-		acs.wpInstances[i] = MakeWprbc(acs.logger, acs.acsEvent, acs.networkCh)
+	for i := 0; i < acs.n; i++ {
+		acs.wpInstances[i] = MakeWprbc(acs.logger, i, acs.n, acs.f, acs.id, acs.round,
+			acs.suite, acs.pubKey, acs.priKey,
+			acs.acsEvent, acs.networkCh)
 	}
 
 	go acs.run()
@@ -87,10 +111,10 @@ L:
 			break L
 		case msg := <-acs.acsInCh:
 			acs.handlemsg(msg)
-		case <-acs.acsEvent:
-			// fmt.Println(msg)
+		case event := <-acs.acsEvent:
+			acs.eventHandler(event)
 		case reqMsg := <-acs.networkCh:
-			fmt.Println(reqMsg)
+			acs.sendToNetwork(reqMsg)
 		}
 	}
 
@@ -105,6 +129,22 @@ L:
 func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 	if msg.WprbcReqField != nil {
 		acs.wpInstances[msg.WprbcReqField.Proposer].InputValue(msg.WprbcReqField)
+	}
+}
+
+func (acs *ACS) eventHandler(event ACSEvent) {
+	if event.status == message.RBCOUTPUT {
+		acs.logger.Printf("ACS deliver [%d] rbc instance.\n", event.instanceId)
+	} else if event.status == message.WPRBCOUTPUT {
+		acs.logger.Printf("ACS deliver [%d] wprbc instance.\n", event.instanceId)
+	}
+}
+
+func (acs *ACS) sendToNetwork(reqMsg NetworkMsg) {
+	if reqMsg.broadcast {
+		acs.network.Broadcast(reqMsg.msg)
+	} else {
+		acs.network.SendToPeer(reqMsg.peerId, reqMsg.msg)
 	}
 }
 

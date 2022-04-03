@@ -31,7 +31,7 @@ func TestLeakGoroutine(t *testing.T) {
 	go server.Start()
 
 	// Create consensus module
-	cm := consensus.MakeConsensusModule(logger, server, releaseCh)
+	cm := consensus.MakeConsensusModule(logger, server, releaseCh, 4, 1, 0)
 	go cm.Consume(consumeCh, stopCh)
 
 	// Wait for server start listen

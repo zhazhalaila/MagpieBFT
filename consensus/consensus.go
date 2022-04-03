@@ -6,9 +6,12 @@ import (
 	"log"
 	"sync"
 
+	"github.com/zhazhalaila/BFTProtocol/keygen/decodekeys"
 	"github.com/zhazhalaila/BFTProtocol/libnet"
 	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
 	"github.com/zhazhalaila/BFTProtocol/message"
+	"go.dedis.ch/kyber/v3/pairing/bn256"
+	"go.dedis.ch/kyber/v3/share"
 )
 
 const (
@@ -34,10 +37,14 @@ type ConsensusModule struct {
 	n  int
 	f  int
 	id int
+	// Used to crypto
+	suite  *bn256.Suite
+	pubKey *share.PubPoly
+	priKey *share.PriShare
 	// Current round
+	round int
 	// Transactions size to consensus within one round
 	// Implement buffer to buffer transactions
-	round        int
 	batchSize    int
 	buffer       []txWithStatus
 	acsInstances map[int]*ACS
@@ -51,14 +58,25 @@ type ConsensusModule struct {
 	releaseCh chan bool
 }
 
-func MakeConsensusModule(logger *log.Logger, network *libnet.Network, releaseCh chan bool) *ConsensusModule {
+func MakeConsensusModule(logger *log.Logger,
+	network *libnet.Network,
+	releaseCh chan bool,
+	n, f, id int) *ConsensusModule {
 	cm := &ConsensusModule{}
 	cm.logger = logger
 	cm.network = network
+	cm.n = n
+	cm.f = f
+	cm.id = id
+	cm.suite = bn256.NewSuite()
+	cm.pubKey = decodekeys.DecodePubShare(cm.suite, cm.n, cm.f+1)
+	cm.priKey = decodekeys.DecodePriShare(cm.suite, cm.n, cm.f+1, cm.id)
+	cm.round = 0
 	cm.buffer = make([]txWithStatus, 65536)
 	cm.acsOutCh = make(chan [][]byte, 100)
 	cm.acsInstances = make(map[int]*ACS)
 	cm.releaseCh = releaseCh
+	cm.logger.Printf("[n=%d] [f=%d] [id=%d].\n", cm.n, cm.f, cm.id)
 	return cm
 }
 
@@ -72,10 +90,7 @@ L:
 		case <-cm.stopCh:
 			break L
 		case msg := <-cm.consumeCh:
-			if _, ok := cm.acsInstances[msg.Round]; !ok {
-				cm.acsInstances[msg.Round] = MakeAcs(cm.logger, cm.network, cm.acsOutCh)
-			}
-			cm.acsInstances[msg.Round].InputValue(msg)
+			cm.handleMsg(msg)
 		case <-cm.acsOutCh:
 		}
 	}
@@ -99,12 +114,23 @@ L:
 	cm.releaseCh <- true
 }
 
-func (cm *ConsensusModule) consensusMsgHandle(msg *message.ConsensusMsg) {
+func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 	if msg.InputTxField != nil {
 		for _, tx := range msg.InputTxField.Transactions {
 			cm.buffer = append(cm.buffer, txWithStatus{status: PROCESS, tx: tx})
 		}
+		cm.startACS(msg.InputTxField.Transactions, cm.round)
+		cm.round++
+	} else {
+		if _, ok := cm.acsInstances[msg.Round]; !ok {
+			cm.acsInstances[msg.Round] = MakeAcs(cm.logger,
+				cm.network, cm.n, cm.f, cm.id, cm.round,
+				cm.suite, cm.pubKey, cm.priKey,
+				cm.acsOutCh)
+		}
+		cm.acsInstances[msg.Round].InputValue(msg)
 	}
+
 }
 
 func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {

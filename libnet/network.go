@@ -263,17 +263,19 @@ func (rn *Network) disconnectPeer(peerInfo message.DisConnectPeer) {
 }
 
 func (rn *Network) recordClient(clientInfo message.SetClient, connectedConn net.Conn) {
-	rn.mu.Lock()
+	rn.mu.RLock()
 	_, ok := rn.clients[clientInfo.ClientId]
 	rn.mu.RUnlock()
 
 	if ok {
 		rn.logger.Printf("[Client:%d] has been connected.\n", clientInfo.ClientId)
 		return
+	} else {
+		rn.logger.Printf("[Client:%d] set success.\n", clientInfo.ClientId)
 	}
 
 	rn.mu.Lock()
-	rn.peers[clientInfo.ClientId] = connectedConn
+	rn.clients[clientInfo.ClientId] = connectedConn
 	rn.mu.Unlock()
 }
 
