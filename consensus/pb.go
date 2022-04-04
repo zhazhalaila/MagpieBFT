@@ -2,7 +2,6 @@ package consensus
 
 import (
 	"bytes"
-	"fmt"
 	"log"
 	"sync"
 
@@ -11,6 +10,11 @@ import (
 	"go.dedis.ch/kyber/v3/pairing/bn256"
 	"go.dedis.ch/kyber/v3/share"
 )
+
+type PBMsgWithSeenProofs struct {
+	seenProofs map[int]message.PROOF
+	pbMsg      *message.PBMsg
+}
 
 type PB struct {
 	// Global log
@@ -41,7 +45,7 @@ type PB struct {
 	// Network channel send data to network (manage by acs)
 	// Done channel to notify acs
 	wg        sync.WaitGroup
-	pbCh      chan *message.PBMsg
+	pbCh      chan PBMsgWithSeenProofs
 	stopCh    chan bool
 	acsEvent  chan ACSEvent
 	networkCh chan NetworkMsg
@@ -65,7 +69,7 @@ func MakePB(logger *log.Logger,
 	pb.suite = suite
 	pb.pubKey = pubKey
 	pb.priKey = priKey
-	pb.pbCh = make(chan *message.PBMsg, pb.n)
+	pb.pbCh = make(chan PBMsgWithSeenProofs, pb.n)
 	pb.stopCh = make(chan bool)
 	pb.acsEvent = acsEvent
 	pb.networkCh = networkCh
@@ -82,7 +86,7 @@ L:
 			break L
 		case msg := <-pb.pbCh:
 			pb.wg.Add(1)
-			fmt.Println(msg)
+			go pb.handlePBMsg(msg)
 		}
 	}
 
@@ -90,7 +94,17 @@ L:
 	pb.done <- true
 }
 
-func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr message.PBReq, proposer int) {
+func (pb *PB) handlePBMsg(msg PBMsgWithSeenProofs) {
+	if msg.pbMsg.PBReqField != nil {
+		pb.handlePBReq(msg.seenProofs, msg.pbMsg.PBReqField, msg.pbMsg.Proposer)
+	} else if msg.pbMsg.PBResField != nil {
+		pb.handlePBRes(msg.pbMsg.PBResField)
+	} else if msg.pbMsg.PBDoneField != nil {
+		pb.handlePBDone(msg.pbMsg.PBDoneField, msg.pbMsg.Proposer)
+	}
+}
+
+func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr *message.PBReq, proposer int) {
 	defer pb.wg.Done()
 
 	if proposer != pb.fromProposer {
@@ -117,9 +131,28 @@ func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr message.PBReq, pr
 
 	pb.proofs = pr.Proofs
 	// Send response to proposer
+
+	share, err := verify.GenShare(pr.ProofHash, pb.suite, pb.priKey)
+	if err != nil {
+		pb.logger.Printf("[Round:%d] [Peer:%d] compute share error.\n", pb.round, pb.id)
+		return
+	}
+	pbRes := message.GenPBMsg(proposer, pb.round)
+	pbRes.ConsensusMsgField.PBMsgField.PBResField = &message.PBRes{
+		Endorser:  pb.id,
+		ProofHash: pr.ProofHash,
+		Share:     share,
+	}
+
+	select {
+	case <-pb.stopCh:
+		return
+	default:
+		pb.networkCh <- NetworkMsg{broadcast: false, peerId: proposer, msg: pbRes}
+	}
 }
 
-func (pb *PB) handlePBRes(ps message.PBRes) {
+func (pb *PB) handlePBRes(ps *message.PBRes) {
 	defer pb.wg.Done()
 
 	if !bytes.Equal(pb.proofsHash, ps.ProofHash) {
@@ -158,12 +191,19 @@ func (pb *PB) handlePBRes(ps message.PBRes) {
 			ProofHash: ps.ProofHash,
 		}
 		// Send to network message channel
+		select {
+		case <-pb.stopCh:
+			return
+		default:
+			pb.networkCh <- NetworkMsg{broadcast: true, msg: pbDone}
+		}
+
 	} else {
 		pb.mu.Unlock()
 	}
 }
 
-func (pb *PB) handlePBDone(pbDone message.PBDone, proposer int) {
+func (pb *PB) handlePBDone(pbDone *message.PBDone, proposer int) {
 	defer pb.wg.Done()
 
 	if proposer != pb.fromProposer {
@@ -171,4 +211,41 @@ func (pb *PB) handlePBDone(pbDone message.PBDone, proposer int) {
 		return
 	}
 
+	err := verify.SignatureVerify(pbDone.ProofHash, pbDone.Signature, pb.suite, pb.pubKey)
+	if err != nil {
+		pb.logger.Printf("[Round:%d] [Peer:%d] receive invalid signature from [%d].\n", pb.round, pb.id, proposer)
+		return
+	}
+
+	pb.mu.Lock()
+	pb.signature = pbDone.Signature
+	pb.mu.Unlock()
+
+	// Out to acs
+	select {
+	case <-pb.stopCh:
+		return
+	default:
+		pb.acsEvent <- ACSEvent{status: message.PBOUTPUT, instanceId: pb.fromProposer, pbOut: pb.proofs}
+	}
+}
+
+// Send data to pb
+func (pb *PB) InputValue(seenProofs map[int]message.PROOF, msg *message.PBMsg) {
+	pbWrapper := PBMsgWithSeenProofs{}
+	if msg.PBReqField != nil {
+		pbWrapper.seenProofs = seenProofs
+	}
+	pbWrapper.pbMsg = msg
+	pb.pbCh <- pbWrapper
+}
+
+// Close pb channel
+func (pb *PB) Stop() {
+	close(pb.stopCh)
+}
+
+// Done channel
+func (pb *PB) Done() <-chan bool {
+	return pb.done
 }

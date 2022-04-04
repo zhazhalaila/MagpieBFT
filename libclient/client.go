@@ -55,22 +55,28 @@ func NewClient(n, f, id int) *Client {
 }
 
 func (c *Client) SendRequest() {
-	txs := make([][]byte, 5)
-	for i := 0; i < 5; i++ {
-		txs[i] = []byte("Hello")
+	txs := make([][]byte, c.n)
+	for i := 0; i < c.n; i++ {
+		txs[i] = make([]byte, c.n)
+		for j := 0; j < c.n; j++ {
+			txs[i][j] = byte(i)
+		}
 	}
 
 	fmt.Println(txs)
 
-	req := message.ReqMsg{
-		ConsensusMsgField: &message.ConsensusMsg{
-			InputTxField: &message.InputTx{
-				Transactions: txs,
+	for i := 0; i < c.n; i++ {
+		subTxs := make([][]byte, 1)
+		subTxs[0] = txs[i]
+		req := message.ReqMsg{
+			ConsensusMsgField: &message.ConsensusMsg{
+				InputTxField: &message.InputTx{
+					Transactions: subTxs,
+				},
 			},
-		},
+		}
+		c.sendMsg(c.peers[i].Sender, req)
 	}
-
-	c.sendMsg(c.peers[0].Sender, req)
 }
 
 // Read peer address

@@ -25,7 +25,7 @@ type ACSEvent struct {
 	status       int
 	instanceId   int
 	rbcOut       []byte
-	wprbcOut     []byte
+	wprbcOut     message.PROOF
 	pbOut        map[int]message.PROOF
 	commonLeader int
 	baOut        int
@@ -47,6 +47,9 @@ type ACS struct {
 	suite  *bn256.Suite
 	pubKey *share.PubPoly
 	priKey *share.PriShare
+	// RBC and WPRBC outs
+	rbcOuts    map[int][]byte
+	seenProofs map[int]message.PROOF
 	// ACS in channel to read data from consensus module
 	// Output channel to consensus
 	// Network channel write data to network
@@ -62,6 +65,7 @@ type ACS struct {
 	acsEvent  chan ACSEvent
 	// Child module. e.g. wprbc protocol, pb protocol, elect protocol and aba protocol...
 	wpInstances []*WPRBC
+	pbInstances []*PB
 }
 
 func MakeAcs(logger *log.Logger,
@@ -81,22 +85,28 @@ func MakeAcs(logger *log.Logger,
 	acs.suite = suite
 	acs.pubKey = pubKey
 	acs.priKey = priKey
+	acs.rbcOuts = make(map[int][]byte)
+	acs.seenProofs = make(map[int]message.PROOF)
 	acs.acsInCh = make(chan *message.ConsensusMsg, 100)
 	acs.networkCh = make(chan NetworkMsg, 100)
 	acs.stopCh = make(chan bool)
 	acs.doneCh = make(chan bool)
 	acs.acsEvent = make(chan ACSEvent, 100)
 	acs.acsOutCh = acsOutCh
-	acs.wpInstances = make([]*WPRBC, 10)
+	acs.wpInstances = make([]*WPRBC, acs.n)
+	acs.pbInstances = make([]*PB, acs.n)
 
-	// Init wprbc instances
+	// Init child instances
 	for i := 0; i < acs.n; i++ {
 		acs.wpInstances[i] = MakeWprbc(acs.logger, i, acs.n, acs.f, acs.id, acs.round,
 			acs.suite, acs.pubKey, acs.priKey,
 			acs.acsEvent, acs.networkCh)
+		acs.pbInstances[i] = MakePB(acs.logger, acs.n, acs.f, acs.id, acs.round, i,
+			acs.suite, acs.pubKey, acs.priKey, acs.acsEvent, acs.networkCh)
 	}
 
 	go acs.run()
+
 	return acs
 }
 
@@ -105,9 +115,7 @@ L:
 	for {
 		select {
 		case <-acs.stopCh:
-			for i := 0; i < len(acs.wpInstances); i++ {
-				acs.wpInstances[i].Stop()
-			}
+			acs.stopAllInstances()
 			break L
 		case msg := <-acs.acsInCh:
 			acs.handlemsg(msg)
@@ -126,6 +134,13 @@ L:
 	acs.doneCh <- true
 }
 
+func (acs *ACS) stopAllInstances() {
+	for i := 0; i < acs.n; i++ {
+		acs.wpInstances[i].Stop()
+		acs.pbInstances[i].Stop()
+	}
+}
+
 func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 	if msg.WprbcReqField != nil {
 		acs.wpInstances[msg.WprbcReqField.Proposer].InputValue(msg.WprbcReqField)
@@ -134,9 +149,11 @@ func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 
 func (acs *ACS) eventHandler(event ACSEvent) {
 	if event.status == message.RBCOUTPUT {
-		acs.logger.Printf("ACS deliver [%d] rbc instance.\n", event.instanceId)
+		acs.rbcOuts[event.instanceId] = event.rbcOut
+		acs.logger.Printf("[Round:%d] ACS deliver [%d] rbc instance.\n", acs.round, event.instanceId)
 	} else if event.status == message.WPRBCOUTPUT {
-		acs.logger.Printf("ACS deliver [%d] wprbc instance.\n", event.instanceId)
+		acs.seenProofs[event.instanceId] = event.wprbcOut
+		acs.logger.Printf("[Round:%d] ACS deliver [%d] wprbc instance.\n", acs.round, event.instanceId)
 	}
 }
 
@@ -152,7 +169,8 @@ func (acs *ACS) sendToNetwork(reqMsg NetworkMsg) {
 func (acs *ACS) output(results [][]byte) {
 	select {
 	case <-acs.stopCh:
-	case acs.acsOutCh <- results:
+	default:
+		acs.acsOutCh <- results
 	}
 }
 

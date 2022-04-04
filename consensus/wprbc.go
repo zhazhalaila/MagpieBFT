@@ -33,6 +33,7 @@ type WPRBC struct {
 	echoThreshold   int
 	readyThreshold  int
 	outputThreshold int
+	valReceived     bool
 	readySent       bool
 	rbcOutputted    bool
 	fromProposer    int
@@ -83,6 +84,8 @@ func MakeWprbc(logger *log.Logger,
 	wp.echoThreshold = 2*f + 1
 	wp.readyThreshold = f + 1
 	wp.outputThreshold = 2*f + 1
+	wp.valReceived = false
+	wp.readySent = false
 	wp.echoSenders = make(map[int]int, wp.n)
 	wp.shards = make(map[[32]byte]map[int][]byte)
 	wp.readySets = make(map[[32]byte]map[int]int)
@@ -121,7 +124,7 @@ func (wp *WPRBC) handleMsg(msg *message.WprbcReq) {
 	} else if msg.READYField != nil {
 		wp.handleREADY(msg.READYField, msg.Sender)
 	} else if msg.PartialShareField != nil {
-		wp.handleShare(msg.PartialShareField, msg.Sender)
+		wp.handleShare(msg.PartialShareField, msg.Proposer, msg.Sender)
 	} else if msg.PROOFField != nil {
 		wp.handleProof(msg.PROOFField, msg.Sender)
 	}
@@ -133,13 +136,14 @@ func (wp *WPRBC) handleVAL(val *message.VAL, sender int) {
 	defer wp.wg.Done()
 
 	if sender != wp.fromProposer {
-		wp.logger.Printf("Get proposer = %d, Excepte = %d.\n", sender, wp.fromProposer)
+		wp.logger.Printf("[Instance:%d] Get proposer = %d, Want = %d.\n", wp.fromProposer, sender, wp.fromProposer)
 		return
 	}
 
-	if merkletree.MerkleTreeVerify(val.Shard, val.RootHash, val.Branch, wp.id) {
-		wp.logger.Printf("[%d] receive VAL from [%d].\n", wp.id, sender)
+	if merkletree.MerkleTreeVerify(val.Shard, val.RootHash, val.Branch, wp.id) && !wp.valReceived {
+		// wp.logger.Printf("[%d] receive VAL from [%d].\n", wp.id, sender)
 		wp.fromLeader = val.RootHash
+		wp.valReceived = true
 
 		echo := message.GenWPRBCMsg(wp.id, wp.round, wp.fromProposer)
 		echo.ConsensusMsgField.WprbcReqField.ECHOField = &message.ECHO{
@@ -151,7 +155,8 @@ func (wp *WPRBC) handleVAL(val *message.VAL, sender int) {
 		select {
 		case <-wp.stopCh:
 			return
-		case wp.networkCh <- NetworkMsg{broadcast: true, msg: echo}:
+		default:
+			wp.networkCh <- NetworkMsg{broadcast: true, msg: echo}
 		}
 	}
 }
@@ -188,7 +193,7 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 	wp.shards[echo.RootHash][sender] = echo.Shard
 	wp.echoSenders[sender] = sender
 
-	wp.logger.Printf("[%d] receive ECHO msg from [%d].\n", wp.id, sender)
+	// wp.logger.Printf("[Round:%d] [Instance:%d] [%d] receive ECHO msg from [%d].\n", wp.round, wp.fromProposer, wp.id, sender)
 
 	if len(wp.shards[echo.RootHash]) >= wp.echoThreshold && !wp.readySent {
 		wp.readySent = true
@@ -227,7 +232,7 @@ func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 	wp.readySets[ready.RootHash][sender] = sender
 	wp.readySenders[sender] = sender
 
-	wp.logger.Printf("[%d] receive READY msg from [%d].\n", wp.id, sender)
+	// wp.logger.Printf("[Instance:%d] [%d] receive READY msg from [%d].\n", wp.fromProposer, wp.id, sender)
 
 	if len(wp.readySets[ready.RootHash]) >= wp.readyThreshold && !wp.readySent {
 		wp.readySent = true
@@ -246,8 +251,12 @@ func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 // Only proposer do this
 // If receive redundant share, return
 // If receive 2f+1 valid shares, compute signature
-func (wp *WPRBC) handleShare(share *message.PartialShare, sender int) {
+func (wp *WPRBC) handleShare(share *message.PartialShare, proposer, sender int) {
 	defer wp.wg.Done()
+
+	if proposer != wp.fromProposer {
+		wp.logger.Printf("Get proposer = %d, want %d.\n", proposer, wp.fromProposer)
+	}
 
 	err := verify.ShareVerify(share.RootHash[:], share.Share, wp.suite, wp.pubKey)
 	if err != nil {
@@ -255,8 +264,6 @@ func (wp *WPRBC) handleShare(share *message.PartialShare, sender int) {
 		wp.logger.Println(err)
 		return
 	}
-
-	wp.logger.Printf("Proposer [%d] receive share from [%d].\n", wp.id, sender)
 
 	wp.mu.Lock()
 	wp.shares[sender] = share.Share
@@ -281,7 +288,8 @@ func (wp *WPRBC) handleShare(share *message.PartialShare, sender int) {
 		select {
 		case <-wp.stopCh:
 			return
-		case wp.networkCh <- NetworkMsg{broadcast: true, msg: proof}:
+		default:
+			wp.networkCh <- NetworkMsg{broadcast: true, msg: proof}
 		}
 	} else {
 		wp.mu.Unlock()
@@ -291,6 +299,11 @@ func (wp *WPRBC) handleShare(share *message.PartialShare, sender int) {
 // If receive valid proof, output to acs
 func (wp *WPRBC) handleProof(proof *message.PROOF, sender int) {
 	defer wp.wg.Done()
+
+	if sender != wp.fromProposer {
+		wp.logger.Printf("Get proposer = %d, Want = %d.\n", sender, wp.fromProposer)
+		return
+	}
 
 	err := verify.SignatureVerify(proof.RootHash[:], proof.Signature, wp.suite, wp.pubKey)
 	if err != nil {
@@ -306,7 +319,12 @@ func (wp *WPRBC) handleProof(proof *message.PROOF, sender int) {
 	select {
 	case <-wp.stopCh:
 		return
-	case wp.acsEvent <- ACSEvent{status: message.WPRBCOUTPUT, instanceId: wp.fromProposer, wprbcOut: wp.signature}:
+	default:
+		wprbcOut := message.PROOF{
+			RootHash:  proof.RootHash,
+			Signature: wp.signature,
+		}
+		wp.acsEvent <- ACSEvent{status: message.WPRBCOUTPUT, instanceId: wp.fromProposer, wprbcOut: wprbcOut}
 	}
 }
 
@@ -320,7 +338,8 @@ func (wp *WPRBC) readyToNetChannel(rootHash [32]byte) {
 	select {
 	case <-wp.stopCh:
 		return
-	case wp.networkCh <- NetworkMsg{broadcast: true, msg: ready}:
+	default:
+		wp.networkCh <- NetworkMsg{broadcast: true, msg: ready}
 	}
 }
 
@@ -338,7 +357,8 @@ func (wp *WPRBC) rbcOutput(rootHash [32]byte) {
 	select {
 	case <-wp.stopCh:
 		return
-	case wp.acsEvent <- ACSEvent{status: message.RBCOUTPUT, instanceId: wp.fromProposer, rbcOut: decode}:
+	default:
+		wp.acsEvent <- ACSEvent{status: message.RBCOUTPUT, instanceId: wp.fromProposer, rbcOut: decode}
 	}
 
 	// start a new goroutine to compute share
@@ -360,21 +380,10 @@ func (wp *WPRBC) rbcOutput(rootHash [32]byte) {
 		select {
 		case <-wp.stopCh:
 			return
-		case wp.networkCh <- NetworkMsg{broadcast: false, peerId: wp.fromProposer, msg: partialShare}:
+		default:
+			wp.networkCh <- NetworkMsg{broadcast: false, peerId: wp.fromProposer, msg: partialShare}
 		}
 	}()
-}
-
-func (wp *WPRBC) outputRBC(msg *message.WprbcReq) {
-	defer wp.wg.Done()
-
-	if msg.Req%5 == 0 {
-		select {
-		case <-wp.stopCh:
-			return
-		case wp.acsEvent <- ACSEvent{status: message.RBCOUTPUT, instanceId: 2, rbcOut: []byte("hello")}:
-		}
-	}
 }
 
 // Send data to wprbc channel

@@ -76,7 +76,6 @@ func MakeConsensusModule(logger *log.Logger,
 	cm.acsOutCh = make(chan [][]byte, 100)
 	cm.acsInstances = make(map[int]*ACS)
 	cm.releaseCh = releaseCh
-	cm.logger.Printf("[n=%d] [f=%d] [id=%d].\n", cm.n, cm.f, cm.id)
 	return cm
 }
 
@@ -119,14 +118,12 @@ func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 		for _, tx := range msg.InputTxField.Transactions {
 			cm.buffer = append(cm.buffer, txWithStatus{status: PROCESS, tx: tx})
 		}
-		cm.startACS(msg.InputTxField.Transactions, cm.round)
+		round := cm.round
+		cm.startACS(msg.InputTxField.Transactions, round)
 		cm.round++
 	} else {
 		if _, ok := cm.acsInstances[msg.Round]; !ok {
-			cm.acsInstances[msg.Round] = MakeAcs(cm.logger,
-				cm.network, cm.n, cm.f, cm.id, cm.round,
-				cm.suite, cm.pubKey, cm.priKey,
-				cm.acsOutCh)
+			cm.acsMaker(msg.Round)
 		}
 		cm.acsInstances[msg.Round].InputValue(msg)
 	}
@@ -134,6 +131,7 @@ func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 }
 
 func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
+	cm.acsMaker(round)
 	// Marshal
 	txsBytes, err := json.Marshal(transactions)
 	if err != nil {
@@ -153,6 +151,7 @@ func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
 		return
 	}
 	rootHash := mt[1]
+
 	// Broadcast val msg
 	cm.wg.Add(1)
 	go func() {
@@ -169,4 +168,12 @@ func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
 			cm.network.SendToPeer(i, msg)
 		}
 	}()
+}
+
+// Create new acs
+func (cm *ConsensusModule) acsMaker(round int) {
+	cm.acsInstances[round] = MakeAcs(cm.logger,
+		cm.network, cm.n, cm.f, cm.id, cm.round,
+		cm.suite, cm.pubKey, cm.priKey,
+		cm.acsOutCh)
 }
