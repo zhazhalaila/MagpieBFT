@@ -100,6 +100,7 @@ func MakeWprbc(logger *log.Logger,
 	return wp
 }
 
+// Start wprbc instance
 func (wp *WPRBC) run() {
 L:
 	for {
@@ -343,6 +344,7 @@ func (wp *WPRBC) readyToNetChannel(rootHash [32]byte) {
 	}
 }
 
+// rbc output with erasure code decode
 func (wp *WPRBC) rbcOutput(rootHash [32]byte) {
 	shards := make([][]byte, wp.n)
 	for i, shard := range wp.shards[rootHash] {

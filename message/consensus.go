@@ -15,6 +15,8 @@ type ConsensusMsg struct {
 	InputTxField         *InputTx
 	WprbcReqField        *WprbcReq
 	PBMsgField           *PBMsg
+	ElectMsgField        *ElectMsg
+	ABAMsgField          *ABAMsg
 }
 
 // Consensus message generator

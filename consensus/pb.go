@@ -137,7 +137,10 @@ func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr *message.PBReq, p
 		pb.logger.Printf("[Round:%d] [Peer:%d] compute share error.\n", pb.round, pb.id)
 		return
 	}
-	pbRes := message.GenPBMsg(proposer, pb.round)
+
+	// pb.logger.Printf("[Round:%d] [Peer:%d] vote to [Proposer:%d].\n", pb.round, pb.id, proposer)
+
+	pbRes := message.GenPBMsg(pb.round, proposer)
 	pbRes.ConsensusMsgField.PBMsgField.PBResField = &message.PBRes{
 		Endorser:  pb.id,
 		ProofHash: pr.ProofHash,
@@ -155,20 +158,20 @@ func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr *message.PBReq, p
 func (pb *PB) handlePBRes(ps *message.PBRes) {
 	defer pb.wg.Done()
 
-	if !bytes.Equal(pb.proofsHash, ps.ProofHash) {
-		pb.logger.Printf("[Proposer:%d] receive invalid proof hash from [%d.\n]", pb.id, ps.Endorser)
-		return
-	}
-
+	pb.mu.Lock()
 	if _, ok := pb.shares[ps.Endorser]; ok {
+		pb.mu.Unlock()
 		pb.logger.Printf("[Proposer:%d] receive redundant PBRes msg from [%d].\n", pb.id, ps.Endorser)
 		return
 	}
+	pb.mu.Unlock()
 
 	err := verify.ShareVerify(ps.ProofHash, ps.Share, pb.suite, pb.pubKey)
 	if err != nil {
 		pb.logger.Printf("[Proposer:%d] receive invalid share from [%d].\n", pb.id, ps.Endorser)
 	}
+
+	// pb.logger.Printf("[Round:%d] [Proposer:%d] receive vote from [Endorser:%d].\n", pb.round, pb.id, ps.Endorser)
 
 	pb.mu.Lock()
 	pb.shares[ps.Endorser] = ps.Share
@@ -185,7 +188,7 @@ func (pb *PB) handlePBRes(ps *message.PBRes) {
 			pb.logger.Println(err)
 			return
 		}
-		pbDone := message.GenPBMsg(pb.fromProposer, pb.round)
+		pbDone := message.GenPBMsg(pb.round, pb.fromProposer)
 		pbDone.ConsensusMsgField.PBMsgField.PBDoneField = &message.PBDone{
 			Signature: signature,
 			ProofHash: ps.ProofHash,
@@ -220,6 +223,8 @@ func (pb *PB) handlePBDone(pbDone *message.PBDone, proposer int) {
 	pb.mu.Lock()
 	pb.signature = pbDone.Signature
 	pb.mu.Unlock()
+
+	// pb.logger.Printf("[Round:%d] [Peer:%d] receive signature from [Proposer:%d].\n", pb.round, pb.id, proposer)
 
 	// Out to acs
 	select {

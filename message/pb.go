@@ -29,7 +29,7 @@ type PBMsg struct {
 }
 
 // PB message generator
-func GenPBMsg(proposer, round int) ReqMsg {
+func GenPBMsg(round, proposer int) ReqMsg {
 	msg := GenConsensusMsg(round)
 	msg.ConsensusMsgField.PBMsgField = &PBMsg{
 		Proposer: proposer,
