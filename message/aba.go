@@ -23,19 +23,21 @@ type COIN struct {
 }
 
 type ABAMsg struct {
-	SubRound  int
-	Sender    int
-	ESTField  *EST
-	AUXField  *AUX
-	CONFField *CONF
-	COINField *COIN
+	InstanceId int
+	SubRound   int
+	Sender     int
+	ESTField   *EST
+	AUXField   *AUX
+	CONFField  *CONF
+	COINField  *COIN
 }
 
-func GenABAMsg(round, subround, sender int) ReqMsg {
+func GenABAMsg(round, instanceId, subround, sender int) ReqMsg {
 	msg := GenConsensusMsg(round)
 	msg.ConsensusMsgField.ABAMsgField = &ABAMsg{
-		SubRound: subround,
-		Sender:   sender,
+		InstanceId: instanceId,
+		SubRound:   subround,
+		Sender:     sender,
 	}
 	return msg
 }

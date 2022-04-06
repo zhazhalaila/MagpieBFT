@@ -28,7 +28,7 @@ func main() {
 	defer logFile.Close()
 
 	// Config logger.
-	logger := log.New(logFile, "logger: ", log.Ldate|log.Ltime|log.Lshortfile)
+	logger := log.New(logFile, "logger: ", 0)
 	logger.Print("Start server.")
 
 	// Create consume. stopCh and release channel

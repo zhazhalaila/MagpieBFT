@@ -194,6 +194,8 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 	wp.shards[echo.RootHash][sender] = echo.Shard
 	wp.echoSenders[sender] = sender
 
+	// wp.logger.Printf("[Round:%d] [RBC%d] instance receive echos from [%v].\n", wp.round, wp.fromProposer, wp.echoSenders)
+
 	// wp.logger.Printf("[Round:%d] [Instance:%d] [%d] receive ECHO msg from [%d].\n", wp.round, wp.fromProposer, wp.id, sender)
 
 	if len(wp.shards[echo.RootHash]) >= wp.echoThreshold && !wp.readySent {
@@ -201,11 +203,9 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 		wp.readyToNetChannel(echo.RootHash)
 	}
 
-	if len(wp.readySets[echo.RootHash]) >= wp.readyThreshold && len(wp.shards[echo.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
+	if len(wp.readySets[echo.RootHash]) >= wp.outputThreshold && len(wp.shards[echo.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
 		wp.rbcOutputted = true
-		if echo.RootHash == wp.fromLeader {
-			wp.rbcOutput(echo.RootHash)
-		}
+		wp.rbcOutput(echo.RootHash)
 	}
 }
 
@@ -241,11 +241,9 @@ func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 		wp.readyToNetChannel(ready.RootHash)
 	}
 
-	if len(wp.readySets[ready.RootHash]) >= wp.readyThreshold && len(wp.shards[ready.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
+	if len(wp.readySets[ready.RootHash]) >= wp.outputThreshold && len(wp.shards[ready.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
 		wp.rbcOutputted = true
-		if ready.RootHash == wp.fromLeader {
-			wp.rbcOutput(ready.RootHash)
-		}
+		wp.rbcOutput(ready.RootHash)
 	}
 }
 

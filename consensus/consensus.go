@@ -131,7 +131,9 @@ func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 }
 
 func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
-	cm.acsMaker(round)
+	if _, ok := cm.acsInstances[round]; !ok {
+		cm.acsMaker(round)
+	}
 	// Marshal
 	txsBytes, err := json.Marshal(transactions)
 	if err != nil {

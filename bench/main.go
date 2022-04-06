@@ -25,5 +25,8 @@ func main() {
 	// As above
 	time.Sleep(100 * time.Millisecond)
 
-	client.SendRequest()
+	for i := 0; i < 1; i++ {
+		client.SendRequest()
+		time.Sleep(200 * time.Millisecond)
+	}
 }

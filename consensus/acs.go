@@ -74,6 +74,7 @@ type ACS struct {
 	wpInstances    []*WPRBC
 	pbInstances    []*PB
 	electInstances []*Elect
+	abaInstances   []*ABA
 }
 
 func MakeAcs(logger *log.Logger,
@@ -99,14 +100,15 @@ func MakeAcs(logger *log.Logger,
 	acs.pbOuts = make(map[int]map[int]message.PROOF)
 	acs.seenProofs = make(map[int]message.PROOF)
 	acs.acsInCh = make(chan *message.ConsensusMsg, 100)
-	acs.networkCh = make(chan NetworkMsg, 100)
+	acs.networkCh = make(chan NetworkMsg, acs.n*acs.n)
 	acs.stopCh = make(chan bool)
 	acs.doneCh = make(chan bool)
-	acs.acsEvent = make(chan ACSEvent, 100)
+	acs.acsEvent = make(chan ACSEvent, acs.n*acs.n)
 	acs.acsOutCh = acsOutCh
 	acs.wpInstances = make([]*WPRBC, acs.n)
 	acs.pbInstances = make([]*PB, acs.n)
 	acs.electInstances = make([]*Elect, acs.n)
+	acs.abaInstances = make([]*ABA, acs.n)
 
 	// Init child instances
 	for i := 0; i < acs.n; i++ {
@@ -117,6 +119,9 @@ func MakeAcs(logger *log.Logger,
 			acs.suite, acs.pubKey, acs.priKey,
 			acs.acsEvent, acs.networkCh)
 		acs.electInstances[i] = MakeElect(acs.logger, acs.n, acs.f, acs.id, acs.round, i,
+			acs.suite, acs.pubKey, acs.priKey,
+			acs.acsEvent, acs.networkCh)
+		acs.abaInstances[i] = MakeABA(acs.logger, acs.n, acs.f, acs.id, i, acs.round,
 			acs.suite, acs.pubKey, acs.priKey,
 			acs.acsEvent, acs.networkCh)
 	}
@@ -145,6 +150,9 @@ L:
 	// Wait for all wprbc instances done
 	for i := 0; i < len(acs.wpInstances); i++ {
 		<-acs.wpInstances[i].Done()
+		<-acs.pbInstances[i].Done()
+		<-acs.electInstances[i].Done()
+		<-acs.abaInstances[i].Done()
 	}
 
 	acs.doneCh <- true
@@ -154,6 +162,8 @@ func (acs *ACS) stopAllInstances() {
 	for i := 0; i < acs.n; i++ {
 		acs.wpInstances[i].Stop()
 		acs.pbInstances[i].Stop()
+		acs.electInstances[i].Stop()
+		acs.abaInstances[i].Stop()
 	}
 }
 
@@ -166,6 +176,9 @@ func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 	}
 	if msg.ElectMsgField != nil {
 		acs.electInstances[msg.ElectMsgField.Epoch].InputValue(msg.ElectMsgField)
+	}
+	if msg.ABAMsgField != nil {
+		acs.abaInstances[msg.ABAMsgField.InstanceId].InputValue(msg.ABAMsgField)
 	}
 }
 
@@ -196,6 +209,13 @@ func (acs *ACS) eventHandler(event ACSEvent) {
 
 	if event.status == message.ELECTOUTPUT {
 		acs.logger.Printf("[Round:%d] [Epoch:%d] ACS deliver [%d] leader.\n", acs.round, acs.epoch, event.commonLeader)
+		if _, ok := acs.pbOuts[event.commonLeader]; ok {
+			acs.logger.Printf("[Round:%d] [Epoch:%d] ACS input 1 to ABA.\n", acs.round, acs.epoch)
+			go acs.abaInstances[0].InputEST(1)
+		} else {
+			acs.logger.Printf("[Round:%d] [Epoch:%d] ACS input 0 to ABA.\n", acs.round, acs.epoch)
+			go acs.abaInstances[0].InputEST(0)
+		}
 	}
 }
 
