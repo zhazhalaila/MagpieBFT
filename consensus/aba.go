@@ -113,7 +113,7 @@ func MakeABA(
 	aba.coinShare = make(map[int]map[int][]byte, 4)
 	aba.values = make(map[int]int, 4)
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
 		aba.estValues[i] = make(map[int][]int, aba.n)
 		aba.auxValues[i] = make(map[int][]int, aba.n)
 		aba.confValues[i] = make(map[int][]int, aba.n)
@@ -179,14 +179,13 @@ func (aba *ABA) start(est int) {
 
 	aba.mu.Lock()
 	_, ok := aba.estSent[aba.subround][est]
+	subround := aba.subround
 	aba.mu.Unlock()
 
 	if ok {
 		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] has sent est = %d.\n", aba.round, aba.subround, aba.id, est)
 	} else {
-		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] broadcast est = %d.\n",
-			aba.round, aba.subround, aba.id, est)
-		aba.sendESTToNetChannel(est, aba.subround)
+		aba.sendESTToNetChannel(subround, est)
 	}
 
 	for {
@@ -207,6 +206,7 @@ func (aba *ABA) eventHandler(event abaEvent) {
 	case AddBinary:
 		aba.mu.Lock()
 		aux := aba.binValues[event.subround][len(aba.binValues[event.subround])-1]
+		aba.logger.Printf("[Round:%d] [Subround:%d] binary values = %v.\n", aba.round, event.subround, aba.binValues[event.subround])
 		aba.mu.Unlock()
 		aba.sendAUXToNetChannel(event.subround, aux)
 	case AuxRecv:
@@ -214,6 +214,7 @@ func (aba *ABA) eventHandler(event abaEvent) {
 	case ConfRecv:
 		aba.coinThreshold(event.subround)
 	case CommonCoin:
+		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] receive [%d] coin.\n", aba.round, event.subround, aba.id, event.coin)
 		aba.setNetEst(event.subround, event.coin)
 	}
 }
@@ -316,6 +317,7 @@ func (aba *ABA) coinThreshold(subround int) {
 
 func (aba *ABA) setNetEst(subround, commonCoin int) {
 	aba.mu.Lock()
+	aba.logger.Printf("[Round:%d] [Subround:%d] aba values = %d coin = %d.\n", aba.round, subround, aba.values[subround], commonCoin)
 	if aba.values[subround] == commonCoin {
 		if aba.alreadyDecide == nil {
 			value := aba.values[subround]
@@ -327,21 +329,25 @@ func (aba *ABA) setNetEst(subround, commonCoin int) {
 			default:
 				aba.acsEvent <- ACSEvent{status: message.BAOUTPUT, baOut: value}
 			}
-			return
 		}
+	} else {
+		aba.mu.Unlock()
 	}
 
+	aba.mu.Lock()
 	aba.subround++
 	aba.est = aba.values[subround]
 	// If ba decide {0, 1} in current epoch, change est to coin in the next epoch.
 	if aba.values[subround] == Both {
 		aba.est = commonCoin
 	}
-	newRound := aba.subround
+	newSubround := aba.subround
 	newEst := aba.est
 	aba.mu.Unlock()
 
-	aba.sendESTToNetChannel(newRound, newEst)
+	aba.logger.Printf("[Round:%d] [Subround:%d] move to next round.\n", aba.round, newSubround)
+
+	aba.sendESTToNetChannel(newSubround, newEst)
 }
 
 func inSlice(s int, list []int) bool {
@@ -357,8 +363,6 @@ func (aba *ABA) handleEST(est *message.EST, subround int, sender int) {
 	aba.mu.Lock()
 	ok := inSlice(sender, aba.estValues[subround][est.BinValue])
 	if ok {
-		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] has receive est from [%d].\n",
-			aba.round, aba.subround, aba.id, sender)
 		aba.mu.Unlock()
 		return
 	}
@@ -368,10 +372,8 @@ func (aba *ABA) handleEST(est *message.EST, subround int, sender int) {
 	estSent := aba.estSent[subround][est.BinValue]
 	aba.mu.Unlock()
 
-	aba.logger.Printf("[Round:%d] [SubRound:%d] Peer receive EST from %d.\n", aba.round, subround, sender)
-
 	if estCount == aba.f+1 && !estSent {
-		aba.sendESTToNetChannel(est.BinValue, subround)
+		aba.sendESTToNetChannel(subround, est.BinValue)
 	}
 
 	if estCount == 2*aba.f+1 {
@@ -401,8 +403,6 @@ func (aba *ABA) handleAUX(aux *message.AUX, subround, sender int) {
 		aba.mu.Unlock()
 	}
 
-	aba.logger.Printf("[Round:%d] [SubRound:%d] Peer receive AUX from %d.\n", aba.round, subround, sender)
-
 	select {
 	case <-aba.stopCh:
 		return
@@ -423,8 +423,6 @@ func (aba *ABA) handleCONF(conf *message.CONF, subround, sender int) {
 		aba.confValues[subround][conf.Value] = append(aba.confValues[subround][conf.Value], sender)
 		aba.mu.Unlock()
 	}
-
-	aba.logger.Printf("[Round:%d] [SubRound:%d] Peer receive CONF from %d.\n", aba.round, subround, sender)
 
 	select {
 	case <-aba.stopCh:
@@ -455,11 +453,9 @@ func (aba *ABA) handleCOIN(coin *message.COIN, subround, sender int) {
 		return
 	}
 
-	aba.logger.Printf("[Round:%d] [SubRound:%d] Peer receive COIN from %d.\n", aba.round, subround, sender)
-
 	aba.coinShare[subround][sender] = coin.Share
 
-	if len(aba.coinShare[subround][sender]) == aba.f+1 {
+	if len(aba.coinShare[subround]) == aba.f+1 {
 		var shares [][]byte
 		for _, share := range aba.coinShare[subround] {
 			shares = append(shares, share)
@@ -483,7 +479,7 @@ func (aba *ABA) handleCOIN(coin *message.COIN, subround, sender int) {
 		case <-aba.stopCh:
 			return
 		default:
-			aba.abaSignal <- abaEvent{eventType: CommonCoin, coin: int(coinHash[0]) % 2}
+			aba.abaSignal <- abaEvent{eventType: CommonCoin, subround: subround, coin: int(coinHash[0]) % 2}
 		}
 	} else {
 		aba.mu.Unlock()
@@ -491,6 +487,10 @@ func (aba *ABA) handleCOIN(coin *message.COIN, subround, sender int) {
 }
 
 func (aba *ABA) sendESTToNetChannel(subround, est int) {
+	aba.mu.Lock()
+	aba.estSent[subround][est] = true
+	aba.mu.Unlock()
+
 	abaEst := message.GenABAMsg(aba.round, aba.instanceId, subround, aba.id)
 	abaEst.ConsensusMsgField.ABAMsgField.ESTField = &message.EST{
 		BinValue: est,
@@ -523,6 +523,8 @@ func (aba *ABA) sendCONFToNetChannel(subround, conf int) {
 	abaConf.ConsensusMsgField.ABAMsgField.CONFField = &message.CONF{
 		Value: conf,
 	}
+
+	aba.logger.Printf("[Round:%d] [Subround:%d] broadcast conf = %d.\n", aba.round, subround, conf)
 
 	select {
 	case <-aba.stopCh:

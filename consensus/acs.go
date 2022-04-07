@@ -183,12 +183,11 @@ func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 }
 
 func (acs *ACS) eventHandler(event ACSEvent) {
-	if event.status == message.RBCOUTPUT {
+	switch event.status {
+	case message.RBCOUTPUT:
 		acs.rbcOuts[event.instanceId] = event.rbcOut
 		acs.logger.Printf("[Round:%d] ACS deliver [%d] rbc instance.\n", acs.round, event.instanceId)
-	}
-
-	if event.status == message.WPRBCOUTPUT {
+	case message.WPRBCOUTPUT:
 		acs.wprbcOuts[event.instanceId] = event.wprbcOut
 		if len(acs.wprbcOuts) == acs.n-acs.f {
 			acs.pbThreshold()
@@ -197,25 +196,20 @@ func (acs *ACS) eventHandler(event ACSEvent) {
 			acs.seenProofs[event.instanceId] = event.wprbcOut
 		}
 		acs.logger.Printf("[Round:%d] ACS deliver [%d] wprbc instance.\n", acs.round, event.instanceId)
-	}
-
-	if event.status == message.PBOUTPUT {
+	case message.PBOUTPUT:
 		acs.pbOuts[event.instanceId] = event.pbOut
 		acs.logger.Printf("[Round:%d] ACS deliver [%d] pb instance.\n", acs.round, event.instanceId)
 		if len(acs.pbOuts) == acs.n-acs.f {
 			acs.electThreshold()
 		}
-	}
-
-	if event.status == message.ELECTOUTPUT {
-		acs.logger.Printf("[Round:%d] [Epoch:%d] ACS deliver [%d] leader.\n", acs.round, acs.epoch, event.commonLeader)
-		if _, ok := acs.pbOuts[event.commonLeader]; ok {
-			acs.logger.Printf("[Round:%d] [Epoch:%d] ACS input 1 to ABA.\n", acs.round, acs.epoch)
-			go acs.abaInstances[0].InputEST(1)
+	case message.ELECTOUTPUT:
+		if acs.id%2 == 0 {
+			acs.abaInstances[0].InputEST(1)
 		} else {
-			acs.logger.Printf("[Round:%d] [Epoch:%d] ACS input 0 to ABA.\n", acs.round, acs.epoch)
-			go acs.abaInstances[0].InputEST(0)
+			acs.abaInstances[0].InputEST(0)
 		}
+	case message.BAOUTPUT:
+		acs.logger.Printf("[Round:%d] [Epoch:%d] ACS receive %d from ABA.\n", acs.round, acs.epoch, event.baOut)
 	}
 }
 
