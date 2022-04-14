@@ -1,14 +1,13 @@
 package consensus
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/zhazhalaila/BFTProtocol/keygen/decodekeys"
 	"github.com/zhazhalaila/BFTProtocol/libnet"
-	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
 	"github.com/zhazhalaila/BFTProtocol/message"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
 	"go.dedis.ch/kyber/v3/share"
@@ -45,11 +44,15 @@ type ConsensusModule struct {
 	round int
 	// Transactions size to consensus within one round
 	// Implement buffer to buffer transactions
+	// If acs done, close acs
 	batchSize    int
 	buffer       []txWithStatus
 	acsInstances map[int]*ACS
+	acsDone      map[int]bool
 	// Output channel to receive data from acs
-	acsOutCh chan [][]byte
+	// Clear channel to clear acs instance
+	acsOutCh chan int
+	acsClear chan int
 	// Consume channel to read data from network
 	// Stop channel to stop read data from network
 	// Release channel to notify network exit
@@ -73,8 +76,10 @@ func MakeConsensusModule(logger *log.Logger,
 	cm.priKey = decodekeys.DecodePriShare(cm.suite, cm.n, cm.f+1, cm.id)
 	cm.round = 0
 	cm.buffer = make([]txWithStatus, 65536)
-	cm.acsOutCh = make(chan [][]byte, 100)
-	cm.acsInstances = make(map[int]*ACS)
+	cm.acsOutCh = make(chan int, 1000)
+	cm.acsClear = make(chan int, 1000)
+	cm.acsInstances = make(map[int]*ACS, 1000)
+	cm.acsDone = make(map[int]bool)
 	cm.releaseCh = releaseCh
 	return cm
 }
@@ -90,16 +95,29 @@ L:
 			break L
 		case msg := <-cm.consumeCh:
 			cm.handleMsg(msg)
-		case <-cm.acsOutCh:
+		case acsId := <-cm.acsOutCh:
+			cm.logger.Printf("[Round:%d] done.\n", acsId)
+			if !cm.acsDone[acsId] {
+				cm.acsDone[acsId] = true
+				cm.acsInstances[acsId].Stop()
+			}
+		case acsId := <-cm.acsClear:
+			cm.acsInstances[acsId] = nil
+			cm.logger.Printf("[Round:%d] clear.\n", acsId)
+		case <-time.After(1 * time.Second):
+			cm.logger.Println("Long time not receive msg from peers...")
 		}
 	}
 
 	fmt.Println("Network close")
 
-	// Stop all acs instances.
+	// Stop all un done acs instances.
 	fmt.Println("Stop all acs instance.")
-	for _, acs := range cm.acsInstances {
-		acs.Stop()
+	for id, acs := range cm.acsInstances {
+		if !cm.acsDone[id] {
+			cm.acsDone[id] = true
+			acs.Stop()
+		}
 	}
 
 	// Wait for all created acs done.
@@ -115,6 +133,7 @@ L:
 
 func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 	if msg.InputTxField != nil {
+		cm.logger.Printf("[Round:%d] Consensus Receive Txs from client.\n", cm.round)
 		for _, tx := range msg.InputTxField.Transactions {
 			cm.buffer = append(cm.buffer, txWithStatus{status: PROCESS, tx: tx})
 		}
@@ -122,8 +141,12 @@ func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 		cm.startACS(msg.InputTxField.Transactions, round)
 		cm.round++
 	} else {
+		if cm.acsDone[msg.Round] {
+			return
+		}
 		if _, ok := cm.acsInstances[msg.Round]; !ok {
 			cm.acsMaker(msg.Round)
+			cm.acsDone[msg.Round] = false
 		}
 		cm.acsInstances[msg.Round].InputValue(msg)
 	}
@@ -133,49 +156,15 @@ func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
 func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
 	if _, ok := cm.acsInstances[round]; !ok {
 		cm.acsMaker(round)
+		cm.acsDone[round] = false
 	}
-	// Marshal
-	txsBytes, err := json.Marshal(transactions)
-	if err != nil {
-		// log
-		return
-	}
-	// Erasure code
-	shards, err := ECEncode(cm.f+1, cm.n-(cm.f+1), txsBytes)
-	if err != nil {
-		// log
-		return
-	}
-	// Merkle tree
-	mt, err := merkletree.MakeMerkleTree(shards)
-	if err != nil {
-		// log
-		return
-	}
-	rootHash := mt[1]
-
-	// Broadcast val msg
-	cm.wg.Add(1)
-	go func() {
-		defer cm.wg.Done()
-
-		for i := 0; i < cm.n; i++ {
-			branch := merkletree.GetMerkleBranch(i, mt)
-			msg := message.GenWPRBCMsg(cm.id, round, cm.id)
-			msg.ConsensusMsgField.WprbcReqField.VALField = &message.VAL{
-				RootHash: rootHash,
-				Branch:   branch,
-				Shard:    shards[i],
-			}
-			cm.network.SendToPeer(i, msg)
-		}
-	}()
+	cm.acsInstances[round].InputTxs(transactions)
 }
 
 // Create new acs
 func (cm *ConsensusModule) acsMaker(round int) {
 	cm.acsInstances[round] = MakeAcs(cm.logger,
-		cm.network, cm.n, cm.f, cm.id, cm.round,
+		cm.network, cm.n, cm.f, cm.id, round,
 		cm.suite, cm.pubKey, cm.priKey,
-		cm.acsOutCh)
+		cm.acsOutCh, cm.acsClear)
 }

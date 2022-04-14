@@ -2,9 +2,11 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"sync"
 
+	"github.com/sasha-s/go-deadlock"
 	"github.com/zhazhalaila/BFTProtocol/message"
 	"github.com/zhazhalaila/BFTProtocol/verify"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
@@ -20,7 +22,7 @@ type PB struct {
 	// Global log
 	logger *log.Logger
 	// Mutex to prevent data race
-	mu sync.Mutex
+	mu deadlock.Mutex
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
 	// Round (Create PB instance round)
 	// From proposer record who broadcast proofs
@@ -69,7 +71,7 @@ func MakePB(logger *log.Logger,
 	pb.suite = suite
 	pb.pubKey = pubKey
 	pb.priKey = priKey
-	pb.pbCh = make(chan PBMsgWithSeenProofs, pb.n)
+	pb.pbCh = make(chan PBMsgWithSeenProofs, pb.n*pb.n)
 	pb.stopCh = make(chan bool)
 	pb.acsEvent = acsEvent
 	pb.networkCh = networkCh
@@ -112,9 +114,16 @@ func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr *message.PBReq, p
 		return
 	}
 
+	var proofs map[int]message.PROOF
+	err := json.Unmarshal(pr.Proofs, &proofs)
+	if err != nil {
+		pb.logger.Println(err)
+		return
+	}
+
 	// If pr.Proofs and seenProofs have the same key but different value, return
 	// If pr.Proofs contain a invalid proof, return
-	for i, proof := range pr.Proofs {
+	for i, proof := range proofs {
 		if seen, ok := seenProofs[i]; ok {
 			if !bytes.Equal(proof.Signature, seen.Signature) {
 				pb.logger.Printf("[Peer:%d] conflict [Proposer:%d] on [WPRBC:%d].\n", pb.id, proposer, i)
@@ -129,7 +138,9 @@ func (pb *PB) handlePBReq(seenProofs map[int]message.PROOF, pr *message.PBReq, p
 		}
 	}
 
-	pb.proofs = pr.Proofs
+	pb.mu.Lock()
+	pb.proofs = proofs
+	pb.mu.Unlock()
 	// Send response to proposer
 
 	share, err := verify.GenShare(pr.ProofHash, pb.suite, pb.priKey)

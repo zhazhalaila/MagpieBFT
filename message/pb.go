@@ -2,8 +2,9 @@ package message
 
 type PBReq struct {
 	// Parties will broadcasr proofs after deliver n-f wprbc instances
+	// Send proof bytes not map to avoid concurrent map fatal error
 	// ProofHash gengrate by hash(Proofs)
-	Proofs    map[int]PROOF
+	Proofs    []byte
 	ProofHash []byte
 }
 

@@ -1,16 +1,23 @@
 package libnet
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"sync"
 
+	"github.com/sasha-s/go-deadlock"
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
+
+// Peer contain net.Conn and a wrapper for net.Conn to write data
+type peer struct {
+	conn    net.Conn
+	encoder *json.Encoder
+}
 
 // io.Reader wrapper to count receive bytes
 type countRead struct {
@@ -26,13 +33,13 @@ func (cr *countRead) Read(p []byte) (n int, err error) {
 
 type Network struct {
 	// RWMutex to prevent data race
-	mu sync.RWMutex
+	mu deadlock.RWMutex
 	// Total read bytes
 	// Record connected clients
 	// Remote peers
 	readBytes int64
 	clients   map[int]net.Conn
-	peers     map[int]net.Conn
+	peers     map[int]peer
 	// Global log
 	// Network port
 	// Network listener
@@ -51,7 +58,7 @@ type Network struct {
 func MakeNetwork(port string, logger *log.Logger, consumeCh chan *message.ConsensusMsg, stopCh, releaseCh chan bool) *Network {
 	rn := &Network{}
 	rn.clients = make(map[int]net.Conn)
-	rn.peers = make(map[int]net.Conn)
+	rn.peers = make(map[int]peer)
 	rn.port = port
 	rn.logger = logger
 	rn.consumeCh = consumeCh
@@ -99,34 +106,27 @@ func (rn *Network) Shutdown() {
 
 func (rn *Network) Broadcast(msg message.ReqMsg) {
 	rn.mu.RLock()
-	peers := rn.peers
-	rn.mu.RUnlock()
+	defer rn.mu.RUnlock()
 
-	// Broadcast message
-	for peerId := range peers {
-		rn.SendToPeer(peerId, msg)
+	for id, peer := range rn.peers {
+		err := peer.encoder.Encode(msg)
+		if err != nil {
+			rn.logger.Printf("Send msg to [Peer:%d] error.\n", id)
+		}
 	}
 }
 
 func (rn *Network) SendToPeer(peerId int, msg message.ReqMsg) {
-
 	rn.mu.RLock()
-	peer, ok := rn.peers[peerId]
-	rn.mu.RUnlock()
+	defer rn.mu.RUnlock()
 
+	peer, ok := rn.peers[peerId]
 	if !ok {
 		rn.logger.Printf("[Peer:%d] disconnect.\n", peerId)
 		return
 	}
 
-	// Message marshal
-	msgEncoded, err := json.Marshal(msg)
-	if err != nil {
-		rn.logger.Printf(err.Error())
-		return
-	}
-
-	_, err = peer.Write(msgEncoded)
+	err := peer.encoder.Encode(msg)
 	if err != nil {
 		rn.logger.Printf("Send msg to [Peer:%d] error.\n", peerId)
 		rn.logger.Printf(err.Error())
@@ -134,10 +134,10 @@ func (rn *Network) SendToPeer(peerId int, msg message.ReqMsg) {
 }
 
 func (rn *Network) ClientResponse(clientId int, msg message.ResMsg) {
-	rn.mu.RLock()
-	client, ok := rn.clients[clientId]
-	rn.mu.RUnlock()
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
 
+	client, ok := rn.clients[clientId]
 	if !ok {
 		rn.logger.Printf("[Client:%d] has been diconnected.\n", clientId)
 		return
@@ -161,7 +161,7 @@ func (rn *Network) ClientResponse(clientId int, msg message.ResMsg) {
 func (rn *Network) handleConn(conn net.Conn) {
 	// read count
 	cr := &countRead{conn: conn, count: 0}
-
+	reader := bufio.NewReader(cr)
 	defer func() {
 		// delete connection from network and close connection.
 		rn.logger.Printf("Remote machine [%s] close connection.\n", conn.RemoteAddr().String())
@@ -171,7 +171,7 @@ func (rn *Network) handleConn(conn net.Conn) {
 		conn.Close()
 	}()
 
-	dec := json.NewDecoder(cr)
+	dec := json.NewDecoder(reader)
 
 	for {
 		var req message.ReqMsg
@@ -226,10 +226,10 @@ func (rn *Network) networkMange(msg *message.NetworkMange, connnectedConn net.Co
 }
 
 func (rn *Network) connectPeer(peerInfo message.ConnectPeer) {
-	rn.mu.RLock()
-	_, ok := rn.peers[peerInfo.PeerId]
-	rn.mu.RUnlock()
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
 
+	_, ok := rn.peers[peerInfo.PeerId]
 	if ok {
 		rn.logger.Printf("[Peer:%d] has been connected.\n", peerInfo.PeerId)
 		return
@@ -243,30 +243,25 @@ func (rn *Network) connectPeer(peerInfo message.ConnectPeer) {
 		rn.logger.Printf("Connect to [Peer:%d] success.\n", peerInfo.PeerId)
 	}
 
-	rn.mu.Lock()
-	rn.peers[peerInfo.PeerId] = conn
-	rn.mu.Unlock()
+	rn.peers[peerInfo.PeerId] = peer{conn: conn, encoder: json.NewEncoder(conn)}
 }
 
 func (rn *Network) disconnectPeer(peerInfo message.DisConnectPeer) {
-	rn.mu.RLock()
-	conn, ok := rn.peers[peerInfo.PeerId]
-	rn.mu.RUnlock()
-
-	if ok {
-		conn.Close()
-	}
-
 	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	peer, ok := rn.peers[peerInfo.PeerId]
+	if ok {
+		peer.conn.Close()
+	}
 	delete(rn.peers, peerInfo.PeerId)
-	rn.mu.Unlock()
 }
 
 func (rn *Network) recordClient(clientInfo message.SetClient, connectedConn net.Conn) {
-	rn.mu.RLock()
-	_, ok := rn.clients[clientInfo.ClientId]
-	rn.mu.RUnlock()
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
 
+	_, ok := rn.clients[clientInfo.ClientId]
 	if ok {
 		rn.logger.Printf("[Client:%d] has been connected.\n", clientInfo.ClientId)
 		return
@@ -274,21 +269,17 @@ func (rn *Network) recordClient(clientInfo message.SetClient, connectedConn net.
 		rn.logger.Printf("[Client:%d] set success.\n", clientInfo.ClientId)
 	}
 
-	rn.mu.Lock()
 	rn.clients[clientInfo.ClientId] = connectedConn
-	rn.mu.Unlock()
 }
 
 func (rn *Network) deleteClient(clientInfo message.DisconnectClient) {
-	rn.mu.RLock()
-	conn, ok := rn.clients[clientInfo.ClientId]
-	rn.mu.RUnlock()
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
 
+	conn, ok := rn.clients[clientInfo.ClientId]
 	if ok {
 		conn.Close()
 	}
 
-	rn.mu.Lock()
 	delete(rn.clients, clientInfo.ClientId)
-	rn.mu.Unlock()
 }

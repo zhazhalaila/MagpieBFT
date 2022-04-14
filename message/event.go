@@ -7,4 +7,5 @@ const (
 	PBOUTPUT    = iota
 	ELECTOUTPUT = iota
 	BAOUTPUT    = iota
+	BASTOP      = iota
 )

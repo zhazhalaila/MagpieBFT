@@ -8,7 +8,7 @@ from pathlib import Path
 
 def start_server(n, f, id):
     if id >= 10:
-        command = "go run main.go -path=log{}.txt -n={} -f={} -id={} -port=:80{}".format(id, n, f, id, id)
+        command = "go run main.go -path=log{}.txt -n={} -f={} -id={} -port=:80{} ".format(id, n, f, id, id)
     else:
         command = "go run main.go -path=log{}.txt -n={} -f={} -id={} -port=:800{}".format(id, n, f, id, id)
     c = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

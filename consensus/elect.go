@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 
+	"github.com/sasha-s/go-deadlock"
 	"github.com/zhazhalaila/BFTProtocol/message"
 	"github.com/zhazhalaila/BFTProtocol/verify"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
@@ -15,7 +16,7 @@ type Elect struct {
 	// Global log
 	logger *log.Logger
 	// Mutex to prevent data race
-	mu sync.Mutex
+	mu deadlock.Mutex
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
 	// Round (Create PB instance round)
 	// Epoch (One election maybe not enough)

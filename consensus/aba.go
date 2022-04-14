@@ -5,7 +5,9 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"time"
 
+	"github.com/sasha-s/go-deadlock"
 	"github.com/zhazhalaila/BFTProtocol/message"
 	"github.com/zhazhalaila/BFTProtocol/verify"
 	"go.dedis.ch/kyber/v3/pairing/bn256"
@@ -20,20 +22,11 @@ const (
 	Both       = iota
 )
 
-type abaEvent struct {
-	// ABA event type .e.g. add binary value ...
-	// Record event happen in which subround
-	// Output common coin
-	eventType int
-	subround  int
-	coin      int
-}
-
 type ABA struct {
 	// Global log
 	logger *log.Logger
 	// Mutex to prevent data race
-	mu sync.Mutex
+	mu deadlock.Mutex
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
 	// Run which ABA instance
 	// Round (Create PB instance round)
@@ -56,34 +49,34 @@ type ABA struct {
 	auxValues  map[int]map[int][]int
 	confValues map[int]map[int][]int
 	// Sent status
-	estSent  map[int]map[int]bool
-	auxSent  map[int]map[int]bool
-	confSent map[int]map[int]bool
-	coinSent map[int]bool
+	estSent map[int]map[int]bool
 	// Coin shares
 	coinShare map[int]map[int][]byte
-	// Values
-	values map[int]int
 	// Used to crypto
 	suite  *bn256.Suite
 	pubKey *share.PubPoly
 	priKey *share.PriShare
 	// WaitGroup to wait for all goroutine done
 	wg sync.WaitGroup
-	// abaSignal chan
-	abaSignal chan abaEvent
+	// Event change channel
+	binChs  []chan int
+	auxChs  []chan struct{}
+	confChs []chan struct{}
+	coinChs []chan int
 	// ABA wait for est value input
 	// ABA channel to read data from acs
 	// Stop channel exit aba
 	// Event channel to notify acs
 	// Network channel send data to network (manage by acs)
 	// Done channel to notify acs
+	// Skip channel (long time no receive aba msg from other parties)
 	estCh     chan int
 	abaCh     chan *message.ABAMsg
 	stopCh    chan bool
 	acsEvent  chan ACSEvent
 	networkCh chan NetworkMsg
 	done      chan bool
+	skip      chan bool
 }
 
 // Worst case need to run four subrounds
@@ -102,37 +95,46 @@ func MakeABA(
 	aba.instanceId = instanceId
 	aba.round = round
 	aba.subround = 0
-	aba.binValues = make(map[int][]int, 4)
-	aba.estValues = make(map[int]map[int][]int, 4)
-	aba.auxValues = make(map[int]map[int][]int, 4)
-	aba.confValues = make(map[int]map[int][]int, 4)
-	aba.estSent = make(map[int]map[int]bool, 4)
-	aba.auxSent = make(map[int]map[int]bool, 4)
-	aba.confSent = make(map[int]map[int]bool, 4)
-	aba.coinSent = make(map[int]bool, 4)
-	aba.coinShare = make(map[int]map[int][]byte, 4)
-	aba.values = make(map[int]int, 4)
+	aba.binValues = make(map[int][]int, 30)
+	aba.estValues = make(map[int]map[int][]int, 30)
+	aba.auxValues = make(map[int]map[int][]int, 30)
+	aba.confValues = make(map[int]map[int][]int, 30)
+	aba.estSent = make(map[int]map[int]bool, 30)
 
-	for i := 0; i < 5; i++ {
+	aba.coinShare = make(map[int]map[int][]byte, 30)
+
+	for i := 0; i < 30; i++ {
 		aba.estValues[i] = make(map[int][]int, aba.n)
 		aba.auxValues[i] = make(map[int][]int, aba.n)
 		aba.confValues[i] = make(map[int][]int, aba.n)
 		aba.estSent[i] = make(map[int]bool, 2)
-		aba.auxSent[i] = make(map[int]bool, 2)
-		aba.confSent[i] = make(map[int]bool, 3)
 		aba.coinShare[i] = make(map[int][]byte, aba.n)
 	}
 
 	aba.suite = suite
 	aba.pubKey = pubKey
 	aba.priKey = priKey
-	aba.abaSignal = make(chan abaEvent, 4*aba.n)
+
+	aba.binChs = make([]chan int, 30)
+	aba.auxChs = make([]chan struct{}, 30)
+	aba.confChs = make([]chan struct{}, 30)
+	aba.coinChs = make([]chan int, 30)
+
+	for i := 0; i < 30; i++ {
+		aba.binChs[i] = make(chan int, 2+1)
+		aba.auxChs[i] = make(chan struct{}, aba.n*aba.n)
+		aba.confChs[i] = make(chan struct{}, aba.n*aba.n)
+		aba.coinChs[i] = make(chan int)
+	}
+
 	aba.estCh = make(chan int)
 	aba.abaCh = make(chan *message.ABAMsg, aba.n)
 	aba.stopCh = make(chan bool)
 	aba.acsEvent = acsEvent
 	aba.networkCh = networkCh
 	aba.done = make(chan bool)
+	aba.skip = make(chan bool)
+
 	go aba.run()
 	return aba
 }
@@ -142,6 +144,7 @@ L:
 	for {
 		select {
 		case <-aba.stopCh:
+			aba.logger.Printf("[Round:%d] [Instance:%d] ABA stop due to all done.\n", aba.round, aba.instanceId)
 			break L
 		case msg := <-aba.abaCh:
 			aba.wg.Add(1)
@@ -150,11 +153,185 @@ L:
 			aba.est = est
 			aba.wg.Add(1)
 			go aba.start(est)
+		case <-time.After(2 * time.Minute):
+			close(aba.skip)
+			aba.logger.Printf("[Round:%d] [Instance:%d] ABA stop due to long time not see msg.\n", aba.round, aba.instanceId)
+			break L
 		}
 	}
 
 	aba.wg.Wait()
 	aba.done <- true
+}
+
+func (aba *ABA) start(est int) {
+	aba.mu.Lock()
+	sent := aba.estSent[aba.subround][est]
+	aba.mu.Unlock()
+
+	defer func() {
+		aba.wg.Done()
+		aba.logger.Printf("[Round:%d] ABA exit.\n", aba.round)
+		aba.acsEvent <- ACSEvent{status: message.BASTOP, baStop: true}
+	}()
+
+	if sent {
+		aba.logger.Printf("[Round:%d] [Subround:0] [Peer:%d] has sent est.\n", aba.round, aba.id)
+	} else {
+		aba.sendESTToNetChannel(aba.subround, est)
+	}
+
+	for {
+		select {
+		case <-aba.skip:
+			aba.logger.Printf("[Round:%d] [Subround:%d] long time not see est, i should exit.\n", aba.round, aba.subround)
+			return
+		case w := <-aba.binChs[aba.subround]:
+			// Broadcast w
+			// aba.logger.Printf("[Round:%d] [Subround:%d] ABA receive bin value = %d.\n", aba.round, aba.subround, w)
+			aba.sendAUXToNetChannel(aba.subround, w)
+		}
+	AuxLoop:
+		// Wait for aux values not none
+		for {
+			select {
+			case <-aba.skip:
+				aba.logger.Printf("[Round:%d] [Subround:%d] long time not see aux, i should exit.\n", aba.round, aba.subround)
+				return
+			case <-aba.auxChs[aba.subround]:
+				ok := aba.auxEvent(aba.subround)
+				if ok {
+					break AuxLoop
+				}
+			}
+		}
+		// aba.logger.Printf("[Round:%d] [Subround:%d] ABA (aux) decide.\n", aba.round, aba.subround)
+		// Wait for conf values
+		var values int
+	ConfLoop:
+		for {
+			select {
+			case <-aba.skip:
+				aba.logger.Printf("[Round:%d] [Subround:%d] long time not see conf, i should exit.\n", aba.round, aba.subround)
+				return
+			case <-aba.confChs[aba.subround]:
+				v, ok := aba.confEvent(aba.subround)
+				if ok {
+					values = v
+					break ConfLoop
+				}
+			}
+		}
+		// aba.logger.Printf("[Round:%d] [Subround:%d] ABA (conf) value decide.\n", aba.round, aba.subround)
+		var coin int
+		select {
+		case <-aba.skip:
+			aba.logger.Printf("[Round:%d] [Subround:%d] long time not see coin, i should exit.\n", aba.round, aba.subround)
+			return
+		default:
+			coin = <-aba.coinChs[aba.subround]
+		}
+		aba.logger.Printf("[Round:%d] [Subround:%d] ABA values=%d coin=%d.\n", aba.round, aba.subround, values, coin)
+		stop := aba.setNewEst(values, coin)
+		if stop {
+			break
+		} else {
+			aba.subround++
+			aba.sendESTToNetChannel(aba.subround, aba.est)
+			aba.logger.Printf("[Round:%d] [Subround:%d] ABA move to next round est = %d.\n", aba.round, aba.subround, aba.est)
+		}
+	}
+}
+
+func (aba *ABA) auxEvent(subround int) bool {
+	aba.mu.Lock()
+	// If receive >=2f+1 aux msg with 1, broadacast 1.
+	if inSlice(1, aba.binValues[subround]) && len(aba.auxValues[subround][1]) >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCONFToNetChannel(subround, 1)
+		return true
+	}
+
+	// If receive >=2f+1 aux msg with 0, broadcast 0.
+	if inSlice(0, aba.binValues[subround]) && len(aba.auxValues[subround][0]) >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCONFToNetChannel(subround, 0)
+		return true
+	}
+
+	// If receive >=2f+1 aux msg with 0 & 1, broadcast (0,1)
+	count := 0
+	for _, v := range aba.binValues[subround] {
+		count += len(aba.auxValues[subround][v])
+	}
+	if count >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCONFToNetChannel(subround, Both)
+		return true
+	}
+
+	aba.mu.Unlock()
+	return false
+}
+
+func (aba *ABA) confEvent(subround int) (int, bool) {
+	aba.mu.Lock()
+	// If receive == 2f+1 conf msg with 1, set value to 1 for current subround
+	if inSlice(1, aba.binValues[subround]) && len(aba.confValues[subround][1]) >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCOINToNetChannel(subround)
+		return 1, true
+	}
+
+	// If receive == 2f+1 conf msg with 0, set value to 0 for current subround
+	if inSlice(0, aba.binValues[subround]) && len(aba.confValues[subround][0]) >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCOINToNetChannel(subround)
+		return 0, true
+	}
+
+	// If receive >= 2f+1 conf msg
+	// len(conf[0]) + len(conf[1]) + len(conf[(0, 1)]) >= 2f+1, set value to 2
+	// len(conf[0]) + len(conf[1]) || len(conf[0]) + len(conf[(0,1)]) || len(conf[1]) + len(conf[(0,1)])
+	count := 0
+
+	if len(aba.binValues[subround]) == 2 {
+		count += len(aba.confValues[subround][Both])
+		count += len(aba.confValues[subround][0])
+		count += len(aba.confValues[subround][1])
+	}
+
+	if count >= aba.n-aba.f {
+		aba.mu.Unlock()
+		aba.sendCOINToNetChannel(subround)
+		return Both, true
+	}
+
+	aba.mu.Unlock()
+	return -1, false
+}
+
+func (aba *ABA) setNewEst(values int, coin int) bool {
+	stop := false
+	if values != Both {
+		if values == coin {
+			if aba.alreadyDecide == nil {
+				aba.alreadyDecide = &values
+				select {
+				case <-aba.stopCh:
+					return stop
+				default:
+					aba.acsEvent <- ACSEvent{status: message.BAOUTPUT, instanceId: aba.instanceId, baOut: values}
+				}
+			} else if *aba.alreadyDecide == values {
+				stop = true
+			}
+		}
+		aba.est = values
+	} else {
+		aba.est = coin
+	}
+	return stop
 }
 
 func (aba *ABA) handleMsg(msg *message.ABAMsg) {
@@ -172,182 +349,6 @@ func (aba *ABA) handleMsg(msg *message.ABAMsg) {
 	if msg.COINField != nil {
 		aba.handleCOIN(msg.COINField, msg.SubRound, msg.Sender)
 	}
-}
-
-func (aba *ABA) start(est int) {
-	defer aba.wg.Done()
-
-	aba.mu.Lock()
-	_, ok := aba.estSent[aba.subround][est]
-	subround := aba.subround
-	aba.mu.Unlock()
-
-	if ok {
-		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] has sent est = %d.\n", aba.round, aba.subround, aba.id, est)
-	} else {
-		aba.sendESTToNetChannel(subround, est)
-	}
-
-	for {
-		select {
-		case <-aba.stopCh:
-			return
-		case e := <-aba.abaSignal:
-			aba.wg.Add(1)
-			go aba.eventHandler(e)
-		}
-	}
-}
-
-func (aba *ABA) eventHandler(event abaEvent) {
-	defer aba.wg.Done()
-
-	switch event.eventType {
-	case AddBinary:
-		aba.mu.Lock()
-		aux := aba.binValues[event.subround][len(aba.binValues[event.subround])-1]
-		aba.logger.Printf("[Round:%d] [Subround:%d] binary values = %v.\n", aba.round, event.subround, aba.binValues[event.subround])
-		aba.mu.Unlock()
-		aba.sendAUXToNetChannel(event.subround, aux)
-	case AuxRecv:
-		aba.confThreshold(event.subround)
-	case ConfRecv:
-		aba.coinThreshold(event.subround)
-	case CommonCoin:
-		aba.logger.Printf("[Round:%d] [Subround:%d] [Peer:%d] receive [%d] coin.\n", aba.round, event.subround, aba.id, event.coin)
-		aba.setNetEst(event.subround, event.coin)
-	}
-}
-
-func (aba *ABA) confThreshold(subround int) {
-	aba.mu.Lock()
-	// If receive >=2f+1 aux msg with 1, broadacast 1.
-	if inSlice(1, aba.binValues[subround]) && len(aba.auxValues[subround][1]) >= aba.n-aba.f {
-		if !aba.confSent[subround][1] {
-			aba.confSent[subround][1] = true
-			aba.mu.Unlock()
-			aba.sendCONFToNetChannel(subround, 1)
-			return
-		} else {
-			aba.mu.Unlock()
-			return
-		}
-	}
-	// If receive >=2f+1 aux msg with 0, broadcast 0.
-	if inSlice(0, aba.binValues[subround]) && len(aba.auxValues[subround][0]) >= aba.n-aba.f {
-		if !aba.confSent[subround][0] {
-			aba.confSent[subround][0] = true
-			aba.mu.Unlock()
-			aba.sendCONFToNetChannel(subround, 0)
-			return
-		} else {
-			aba.mu.Unlock()
-			return
-		}
-	}
-	// If receive >=2f+1 aux msg with 0 & 1, broadcast (0,1)
-	count := 0
-	for _, v := range aba.binValues[subround] {
-		count += len(aba.auxValues[subround][v])
-	}
-	if count >= aba.n-aba.f {
-		if !aba.confSent[subround][Both] {
-			aba.confSent[subround][Both] = true
-			aba.mu.Unlock()
-			aba.sendCONFToNetChannel(subround, Both)
-			return
-		}
-	}
-
-	aba.mu.Unlock()
-}
-
-func (aba *ABA) coinThreshold(subround int) {
-	aba.mu.Lock()
-	// If receive == 2f+1 conf msg with 1, set value to 1 for current subround
-	if inSlice(1, aba.binValues[subround]) && len(aba.confValues[subround][1]) == aba.n-aba.f {
-		if !aba.coinSent[subround] {
-			aba.coinSent[subround] = true
-			aba.values[subround] = 1
-			aba.mu.Unlock()
-			aba.sendCOINToNetChannel(subround)
-			return
-		} else {
-			aba.mu.Unlock()
-			return
-		}
-	}
-	// If receive == 2f+1 conf msg with 0, set value to 0 for current subround
-	if inSlice(0, aba.binValues[subround]) && len(aba.confValues[subround][0]) == aba.n-aba.f {
-		if !aba.coinSent[subround] {
-			aba.coinSent[subround] = true
-			aba.values[subround] = 0
-			aba.mu.Unlock()
-			aba.sendCOINToNetChannel(subround)
-			return
-		} else {
-			aba.mu.Unlock()
-			return
-		}
-	}
-
-	// If receive >= 2f+1 conf msg
-	// len(conf[0]) + len(conf[1]) + len(conf[(0, 1)]) >= 2f+1, set value to 2
-	// len(conf[0]) + len(conf[1]) || len(conf[0]) + len(conf[(0,1)]) || len(conf[1]) + len(conf[(0,1)])
-	count := 0
-	for _, v := range aba.binValues[subround] {
-		count += len(aba.confValues[v])
-	}
-	if len(aba.binValues[subround]) == 2 {
-		count += len(aba.confValues[Both])
-	}
-
-	if count >= aba.n-aba.f {
-		if !aba.coinSent[subround] {
-			aba.coinSent[subround] = true
-			aba.values[subround] = Both
-			aba.mu.Unlock()
-			aba.sendCOINToNetChannel(subround)
-			return
-		}
-	}
-
-	aba.mu.Unlock()
-}
-
-func (aba *ABA) setNetEst(subround, commonCoin int) {
-	aba.mu.Lock()
-	aba.logger.Printf("[Round:%d] [Subround:%d] aba values = %d coin = %d.\n", aba.round, subround, aba.values[subround], commonCoin)
-	if aba.values[subround] == commonCoin {
-		if aba.alreadyDecide == nil {
-			value := aba.values[subround]
-			aba.alreadyDecide = &value
-			aba.mu.Unlock()
-			select {
-			case <-aba.stopCh:
-				return
-			default:
-				aba.acsEvent <- ACSEvent{status: message.BAOUTPUT, baOut: value}
-			}
-		}
-	} else {
-		aba.mu.Unlock()
-	}
-
-	aba.mu.Lock()
-	aba.subround++
-	aba.est = aba.values[subround]
-	// If ba decide {0, 1} in current epoch, change est to coin in the next epoch.
-	if aba.values[subround] == Both {
-		aba.est = commonCoin
-	}
-	newSubround := aba.subround
-	newEst := aba.est
-	aba.mu.Unlock()
-
-	aba.logger.Printf("[Round:%d] [Subround:%d] move to next round.\n", aba.round, newSubround)
-
-	aba.sendESTToNetChannel(newSubround, newEst)
 }
 
 func inSlice(s int, list []int) bool {
@@ -385,7 +386,9 @@ func (aba *ABA) handleEST(est *message.EST, subround int, sender int) {
 		case <-aba.stopCh:
 			return
 		default:
-			aba.abaSignal <- abaEvent{eventType: AddBinary, subround: subround}
+			aba.binChs[subround] <- est.BinValue
+			aba.auxChs[subround] <- struct{}{}
+			aba.confChs[subround] <- struct{}{}
 		}
 	}
 }
@@ -407,7 +410,7 @@ func (aba *ABA) handleAUX(aux *message.AUX, subround, sender int) {
 	case <-aba.stopCh:
 		return
 	default:
-		aba.abaSignal <- abaEvent{eventType: AuxRecv, subround: subround}
+		aba.auxChs[subround] <- struct{}{}
 	}
 }
 
@@ -428,7 +431,7 @@ func (aba *ABA) handleCONF(conf *message.CONF, subround, sender int) {
 	case <-aba.stopCh:
 		return
 	default:
-		aba.abaSignal <- abaEvent{eventType: ConfRecv, subround: subround}
+		aba.confChs[subround] <- struct{}{}
 	}
 }
 
@@ -479,7 +482,7 @@ func (aba *ABA) handleCOIN(coin *message.COIN, subround, sender int) {
 		case <-aba.stopCh:
 			return
 		default:
-			aba.abaSignal <- abaEvent{eventType: CommonCoin, subround: subround, coin: int(coinHash[0]) % 2}
+			aba.coinChs[subround] <- int(coinHash[0]) % 2
 		}
 	} else {
 		aba.mu.Unlock()
@@ -523,8 +526,6 @@ func (aba *ABA) sendCONFToNetChannel(subround, conf int) {
 	abaConf.ConsensusMsgField.ABAMsgField.CONFField = &message.CONF{
 		Value: conf,
 	}
-
-	aba.logger.Printf("[Round:%d] [Subround:%d] broadcast conf = %d.\n", aba.round, subround, conf)
 
 	select {
 	case <-aba.stopCh:

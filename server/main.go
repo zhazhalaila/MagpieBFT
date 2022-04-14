@@ -4,11 +4,26 @@ import (
 	"flag"
 	"log"
 	"os"
+	"runtime"
+	"time"
 
 	"github.com/zhazhalaila/BFTProtocol/consensus"
 	"github.com/zhazhalaila/BFTProtocol/libnet"
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
+
+func PrintMemUsage(logger *log.Logger) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	// For info on each, see: https://golang.org/pkg/runtime/#MemStats
+	logger.Printf("Alloc = %v MiB.\n", bToMb(m.Alloc))
+	logger.Printf("Sys = %v MiB", bToMb(m.Sys))
+	logger.Printf("NumGC = %v\n", m.NumGC)
+}
+
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
 
 func main() {
 	path := flag.String("path", "log.txt", "log file path")
@@ -32,7 +47,7 @@ func main() {
 	logger.Print("Start server.")
 
 	// Create consume. stopCh and release channel
-	consumeCh := make(chan *message.ConsensusMsg, 100*100)
+	consumeCh := make(chan *message.ConsensusMsg, 10000)
 	stopCh := make(chan bool)
 	releaseCh := make(chan bool)
 
@@ -42,6 +57,14 @@ func main() {
 	// Create consensus module.
 	cm := consensus.MakeConsensusModule(logger, rn, releaseCh, *n, *f, *id)
 	go cm.Consume(consumeCh, stopCh)
+
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			logger.Printf("Runtime Goroutine = [%d].\n", runtime.NumGoroutine())
+			PrintMemUsage(logger)
+		}
+	}()
 
 	// Start server.
 	rn.Start()

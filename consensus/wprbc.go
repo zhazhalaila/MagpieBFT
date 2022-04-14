@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 
+	"github.com/sasha-s/go-deadlock"
 	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
 	"github.com/zhazhalaila/BFTProtocol/message"
 	"github.com/zhazhalaila/BFTProtocol/verify"
@@ -16,7 +17,7 @@ type WPRBC struct {
 	// Global log
 	logger *log.Logger
 	// Mutex to prevent data race
-	mu sync.Mutex
+	mu deadlock.Mutex
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
 	// Round (Create WPRBC instance round)
 	// Echo threshold = OutputThreshold = 2f+1, Ready threshold = Erasure code threshold = f+1
@@ -63,7 +64,7 @@ type WPRBC struct {
 }
 
 func MakeWprbc(logger *log.Logger,
-	fromProposer, n, f, id, round int,
+	n, f, id, round, fromProposer int,
 	suite *bn256.Suite,
 	pubKey *share.PubPoly,
 	priKey *share.PriShare,
@@ -114,6 +115,7 @@ L:
 	}
 
 	wp.wg.Wait()
+	wp.logger.Printf("[Round:%d] WPRBC instance [%d] done.\n", wp.round, wp.fromProposer)
 	wp.done <- true
 }
 
@@ -169,13 +171,13 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 	defer wp.wg.Done()
 
 	wp.mu.Lock()
-	defer wp.mu.Unlock()
 
 	_, ok1 := wp.shards[echo.RootHash]
 	_, ok2 := wp.shards[echo.RootHash][sender]
 	_, ok3 := wp.echoSenders[sender]
 
 	if (ok1 && ok2) || ok3 {
+		wp.mu.Unlock()
 		fmt.Printf("Redundant echo msg from [%d].\n", sender)
 		return
 	}
@@ -183,6 +185,7 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 	ok := merkletree.MerkleTreeVerify(echo.Shard, echo.RootHash, echo.Branch, sender)
 
 	if !ok {
+		wp.mu.Unlock()
 		wp.logger.Printf("[%d] receive unvalid ECHO msg from [%d].\n", wp.id, sender)
 		return
 	}
@@ -200,13 +203,19 @@ func (wp *WPRBC) handleECHO(echo *message.ECHO, sender int) {
 
 	if len(wp.shards[echo.RootHash]) >= wp.echoThreshold && !wp.readySent {
 		wp.readySent = true
+		wp.mu.Unlock()
 		wp.readyToNetChannel(echo.RootHash)
+		return
 	}
 
 	if len(wp.readySets[echo.RootHash]) >= wp.outputThreshold && len(wp.shards[echo.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
 		wp.rbcOutputted = true
+		wp.mu.Unlock()
 		wp.rbcOutput(echo.RootHash)
+		return
 	}
+
+	wp.mu.Unlock()
 }
 
 // If receive redundant ready msg, return
@@ -216,13 +225,13 @@ func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 	defer wp.wg.Done()
 
 	wp.mu.Lock()
-	defer wp.mu.Unlock()
 
 	_, ok1 := wp.readySenders[sender]
 	_, ok2 := wp.readySets[ready.RootHash][sender]
 
 	if ok1 || ok2 {
 		fmt.Printf("Redundant ready msg from [%d].\n", sender)
+		wp.mu.Unlock()
 		return
 	}
 
@@ -237,14 +246,20 @@ func (wp *WPRBC) handleREADY(ready *message.READY, sender int) {
 
 	if len(wp.readySets[ready.RootHash]) >= wp.readyThreshold && !wp.readySent {
 		wp.readySent = true
+		wp.mu.Unlock()
 		// broadcast ready
 		wp.readyToNetChannel(ready.RootHash)
+		return
 	}
 
 	if len(wp.readySets[ready.RootHash]) >= wp.outputThreshold && len(wp.shards[ready.RootHash]) >= wp.f+1 && !wp.rbcOutputted {
 		wp.rbcOutputted = true
+		wp.mu.Unlock()
 		wp.rbcOutput(ready.RootHash)
+		return
 	}
+
+	wp.mu.Unlock()
 }
 
 // Only proposer do this
