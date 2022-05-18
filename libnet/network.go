@@ -133,7 +133,7 @@ func (rn *Network) SendToPeer(peerId int, msg message.ReqMsg) {
 	}
 }
 
-func (rn *Network) ClientResponse(clientId int, msg message.ResMsg) {
+func (rn *Network) ClientResponse(clientId int, msg message.ClientRes) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -276,10 +276,6 @@ func (rn *Network) deleteClient(clientInfo message.DisconnectClient) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	conn, ok := rn.clients[clientInfo.ClientId]
-	if ok {
-		conn.Close()
-	}
-
 	delete(rn.clients, clientInfo.ClientId)
+	rn.logger.Printf("[Client:%d] delete success.\n", clientInfo.ClientId)
 }

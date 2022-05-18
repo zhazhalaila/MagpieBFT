@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/zhazhalaila/BFTProtocol/keygen/decodekeys"
 	"github.com/zhazhalaila/BFTProtocol/libnet"
@@ -103,9 +102,7 @@ L:
 			}
 		case acsId := <-cm.acsClear:
 			cm.acsInstances[acsId] = nil
-			cm.logger.Printf("[Round:%d] clear.\n", acsId)
-		case <-time.After(1 * time.Second):
-			cm.logger.Println("Long time not receive msg from peers...")
+			cm.logger.Printf("[Round:%d] Consensus clear.\n", acsId)
 		}
 	}
 
@@ -132,33 +129,34 @@ L:
 }
 
 func (cm *ConsensusModule) handleMsg(msg *message.ConsensusMsg) {
+	// Receive new txs from client input to acs
 	if msg.InputTxField != nil {
 		cm.logger.Printf("[Round:%d] Consensus Receive Txs from client.\n", cm.round)
 		for _, tx := range msg.InputTxField.Transactions {
 			cm.buffer = append(cm.buffer, txWithStatus{status: PROCESS, tx: tx})
 		}
 		round := cm.round
-		cm.startACS(msg.InputTxField.Transactions, round)
+		cm.startACS(msg.InputTxField, round)
 		cm.round++
-	} else {
-		if cm.acsDone[msg.Round] {
-			return
-		}
-		if _, ok := cm.acsInstances[msg.Round]; !ok {
-			cm.acsMaker(msg.Round)
-			cm.acsDone[msg.Round] = false
-		}
-		cm.acsInstances[msg.Round].InputValue(msg)
+		return
 	}
-
+	// Handle normal consensus msg
+	if cm.acsDone[msg.Round] {
+		return
+	}
+	if _, ok := cm.acsInstances[msg.Round]; !ok {
+		cm.acsMaker(msg.Round)
+		cm.acsDone[msg.Round] = false
+	}
+	cm.acsInstances[msg.Round].InputValue(msg)
 }
 
-func (cm *ConsensusModule) startACS(transactions [][]byte, round int) {
+func (cm *ConsensusModule) startACS(txMsg *message.InputTx, round int) {
 	if _, ok := cm.acsInstances[round]; !ok {
 		cm.acsMaker(round)
 		cm.acsDone[round] = false
 	}
-	cm.acsInstances[round].InputTxs(transactions)
+	cm.acsInstances[round].InputTxs(txMsg)
 }
 
 // Create new acs

@@ -49,7 +49,7 @@ func TestLeakGoroutine(t *testing.T) {
 		msg := message.ReqMsg{
 			ConsensusMsgField: &message.ConsensusMsg{
 				Round: i,
-				WprbcReqField: &message.WprbcReq{
+				PCBCReqField: &message.PCBCReq{
 					Proposer: 2,
 					Req:      i,
 				},

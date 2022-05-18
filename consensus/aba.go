@@ -144,7 +144,6 @@ L:
 	for {
 		select {
 		case <-aba.stopCh:
-			aba.logger.Printf("[Round:%d] [Instance:%d] ABA stop due to all done.\n", aba.round, aba.instanceId)
 			break L
 		case msg := <-aba.abaCh:
 			aba.wg.Add(1)
@@ -154,14 +153,16 @@ L:
 			aba.wg.Add(1)
 			go aba.start(est)
 		case <-time.After(2 * time.Minute):
-			close(aba.skip)
-			aba.logger.Printf("[Round:%d] [Instance:%d] ABA stop due to long time not see msg.\n", aba.round, aba.instanceId)
 			break L
 		}
 	}
 
+	aba.logger.Printf("[Round:%d] [InstanceId:%d] ABA close skip channel.\n", aba.round, aba.instanceId)
+	close(aba.skip)
 	aba.wg.Wait()
+	aba.logger.Printf("[Round:%d] [InstanceId:%d] ABA notify ACS.\n", aba.round, aba.instanceId)
 	aba.done <- true
+	aba.logger.Printf("[Round:%d] [InstanceId:%d] ABA exit.\n", aba.round, aba.instanceId)
 }
 
 func (aba *ABA) start(est int) {
@@ -171,8 +172,20 @@ func (aba *ABA) start(est int) {
 
 	defer func() {
 		aba.wg.Done()
-		aba.logger.Printf("[Round:%d] ABA exit.\n", aba.round)
-		aba.acsEvent <- ACSEvent{status: message.BASTOP, baStop: true}
+		aba.logger.Printf("[Round:%d] [InstanceId:%d] ABA exit.\n", aba.round, aba.instanceId)
+		select {
+		case <-aba.stopCh:
+			aba.logger.Printf("[Round:%d] [InstanceId:%d] capture aba stop signal, i should exit.\n", aba.round, aba.instanceId)
+			return
+		default:
+		}
+
+		select {
+		case <-aba.stopCh:
+			aba.logger.Printf("[Round:%d] [InstanceId:%d] receive aba stop signal, i should exit.\n", aba.round, aba.instanceId)
+			return
+		case aba.acsEvent <- ACSEvent{status: message.BASTOP, instanceId: aba.instanceId, baStop: true}:
+		}
 	}()
 
 	if sent {
@@ -184,11 +197,10 @@ func (aba *ABA) start(est int) {
 	for {
 		select {
 		case <-aba.skip:
-			aba.logger.Printf("[Round:%d] [Subround:%d] long time not see est, i should exit.\n", aba.round, aba.subround)
+			// aba.logger.Printf("[Round:%d] [Subround:%d] long time not see est, i should exit.\n", aba.round, aba.subround)
 			return
 		case w := <-aba.binChs[aba.subround]:
-			// Broadcast w
-			// aba.logger.Printf("[Round:%d] [Subround:%d] ABA receive bin value = %d.\n", aba.round, aba.subround, w)
+			// aba.logger.Printf("[Round:%d] [InstanceId:%d] [Subround:%d] ABA receive bin value = %d.\n", aba.round, aba.instanceId, aba.subround, w)
 			aba.sendAUXToNetChannel(aba.subround, w)
 		}
 	AuxLoop:
@@ -196,7 +208,7 @@ func (aba *ABA) start(est int) {
 		for {
 			select {
 			case <-aba.skip:
-				aba.logger.Printf("[Round:%d] [Subround:%d] long time not see aux, i should exit.\n", aba.round, aba.subround)
+				// aba.logger.Printf("[Round:%d] [Subround:%d] long time not see aux, i should exit.\n", aba.round, aba.subround)
 				return
 			case <-aba.auxChs[aba.subround]:
 				ok := aba.auxEvent(aba.subround)
@@ -205,14 +217,14 @@ func (aba *ABA) start(est int) {
 				}
 			}
 		}
-		// aba.logger.Printf("[Round:%d] [Subround:%d] ABA (aux) decide.\n", aba.round, aba.subround)
+		// aba.logger.Printf("[Round:%d] [InstanceId:%d] [Subround:%d] ABA (aux) decide.\n", aba.round, aba.instanceId, aba.subround)
 		// Wait for conf values
 		var values int
 	ConfLoop:
 		for {
 			select {
 			case <-aba.skip:
-				aba.logger.Printf("[Round:%d] [Subround:%d] long time not see conf, i should exit.\n", aba.round, aba.subround)
+				// aba.logger.Printf("[Round:%d] [Subround:%d] long time not see conf, i should exit.\n", aba.round, aba.subround)
 				return
 			case <-aba.confChs[aba.subround]:
 				v, ok := aba.confEvent(aba.subround)
@@ -226,19 +238,18 @@ func (aba *ABA) start(est int) {
 		var coin int
 		select {
 		case <-aba.skip:
-			aba.logger.Printf("[Round:%d] [Subround:%d] long time not see coin, i should exit.\n", aba.round, aba.subround)
+			// aba.logger.Printf("[Round:%d] [Subround:%d] long time not see coin, i should exit.\n", aba.round, aba.subround)
 			return
-		default:
-			coin = <-aba.coinChs[aba.subround]
+		case coin = <-aba.coinChs[aba.subround]:
 		}
-		aba.logger.Printf("[Round:%d] [Subround:%d] ABA values=%d coin=%d.\n", aba.round, aba.subround, values, coin)
+		// aba.logger.Printf("[Round:%d] [InstanceId:%d] [Subround:%d] ABA values=%d coin=%d.\n", aba.round, aba.instanceId, aba.subround, values, coin)
 		stop := aba.setNewEst(values, coin)
 		if stop {
 			break
 		} else {
 			aba.subround++
 			aba.sendESTToNetChannel(aba.subround, aba.est)
-			aba.logger.Printf("[Round:%d] [Subround:%d] ABA move to next round est = %d.\n", aba.round, aba.subround, aba.est)
+			// aba.logger.Printf("[Round:%d] [InstanceId:%d] [Subround:%d] ABA move to next round est = %d.\n", aba.round, aba.instanceId, aba.subround, aba.est)
 		}
 	}
 }
@@ -382,6 +393,15 @@ func (aba *ABA) handleEST(est *message.EST, subround int, sender int) {
 		aba.mu.Lock()
 		aba.binValues[subround] = append(aba.binValues[subround], est.BinValue)
 		aba.mu.Unlock()
+
+		select {
+		case <-aba.skip:
+			return
+		case <-aba.stopCh:
+			return
+		default:
+		}
+
 		select {
 		case <-aba.stopCh:
 			return
@@ -407,6 +427,14 @@ func (aba *ABA) handleAUX(aux *message.AUX, subround, sender int) {
 	}
 
 	select {
+	case <-aba.skip:
+		return
+	case <-aba.stopCh:
+		return
+	default:
+	}
+
+	select {
 	case <-aba.stopCh:
 		return
 	default:
@@ -425,6 +453,14 @@ func (aba *ABA) handleCONF(conf *message.CONF, subround, sender int) {
 	} else {
 		aba.confValues[subround][conf.Value] = append(aba.confValues[subround][conf.Value], sender)
 		aba.mu.Unlock()
+	}
+
+	select {
+	case <-aba.skip:
+		return
+	case <-aba.stopCh:
+		return
+	default:
 	}
 
 	select {
@@ -478,6 +514,15 @@ func (aba *ABA) handleCOIN(coin *message.COIN, subround, sender int) {
 		}
 		// Generate common coin
 		coinHash := sha256.Sum256(signature)
+
+		select {
+		case <-aba.skip:
+			return
+		case <-aba.stopCh:
+			return
+		default:
+		}
+
 		select {
 		case <-aba.stopCh:
 			return
@@ -503,6 +548,12 @@ func (aba *ABA) sendESTToNetChannel(subround, est int) {
 	case <-aba.stopCh:
 		return
 	default:
+	}
+
+	select {
+	case <-aba.stopCh:
+		return
+	default:
 		aba.networkCh <- NetworkMsg{broadcast: true, msg: abaEst}
 	}
 }
@@ -517,6 +568,12 @@ func (aba *ABA) sendAUXToNetChannel(subround, aux int) {
 	case <-aba.stopCh:
 		return
 	default:
+	}
+
+	select {
+	case <-aba.stopCh:
+		return
+	default:
 		aba.networkCh <- NetworkMsg{broadcast: true, msg: abaAux}
 	}
 }
@@ -525,6 +582,12 @@ func (aba *ABA) sendCONFToNetChannel(subround, conf int) {
 	abaConf := message.GenABAMsg(aba.round, aba.instanceId, subround, aba.id)
 	abaConf.ConsensusMsgField.ABAMsgField.CONFField = &message.CONF{
 		Value: conf,
+	}
+
+	select {
+	case <-aba.stopCh:
+		return
+	default:
 	}
 
 	select {
@@ -552,6 +615,12 @@ func (aba *ABA) sendCOINToNetChannel(subround int) {
 	abaCoin.ConsensusMsgField.ABAMsgField.COINField = &message.COIN{
 		HashMsg: coinHash,
 		Share:   coinShare,
+	}
+
+	select {
+	case <-aba.stopCh:
+		return
+	default:
 	}
 
 	select {

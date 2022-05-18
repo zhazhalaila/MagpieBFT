@@ -27,8 +27,8 @@ type PROOF struct {
 	RootHash  [32]byte
 }
 
-type WprbcReq struct {
-	// Only proposer can send VAL msg to start wprbc phase
+type PCBCReq struct {
+	// Only proposer can send VAL msg to start PCBC phase
 	Proposer          int
 	Sender            int
 	Req               int
@@ -39,10 +39,10 @@ type WprbcReq struct {
 	PROOFField        *PROOF
 }
 
-// WPRBC message generator
-func GenWPRBCMsg(sender, round, proposer int) ReqMsg {
+// PCBC message generator
+func GenPCBCMsg(sender, round, proposer int) ReqMsg {
 	msg := GenConsensusMsg(round)
-	msg.ConsensusMsgField.WprbcReqField = &WprbcReq{
+	msg.ConsensusMsgField.PCBCReqField = &PCBCReq{
 		Proposer: proposer,
 		Sender:   sender,
 	}

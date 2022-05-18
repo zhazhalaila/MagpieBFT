@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log"
 	"strconv"
-	"sync"
 
 	"github.com/zhazhalaila/BFTProtocol/libnet"
 	merkletree "github.com/zhazhalaila/BFTProtocol/merkleTree"
@@ -16,10 +15,12 @@ import (
 
 type NetworkMsg struct {
 	// Write msg to network
-	// Broadcast msg or send msg to peer
+	// Broadcast msg or send msg to peer or send response to client
 	broadcast bool
 	peerId    int
 	msg       message.ReqMsg
+	clientRes bool
+	res       message.ClientRes
 }
 
 type ACSEvent struct {
@@ -28,12 +29,14 @@ type ACSEvent struct {
 	// Common leader was elected from elect phase
 	status       int
 	instanceId   int
+	epoch        int
 	rbcOut       []byte
-	wprbcOut     message.PROOF
+	pcbcOut      message.PROOF
 	pbOut        map[int]message.PROOF
 	commonLeader int
 	baOut        int
 	baStop       bool
+	decide       []int
 }
 
 type ACS struct {
@@ -41,15 +44,27 @@ type ACS struct {
 	logger *log.Logger
 	// Network module
 	network *libnet.Network
-	// WaitGroup to wait for all created goroutine(write msg to network) done
-	wg sync.WaitGroup
+	// N=3F+1
 	n  int
 	f  int
 	id int
 	// Current round
-	// Epoch record run BA times
-	round int
-	epoch int
+	// ElectTimes record run BA times
+	// Current leader
+	// Client ID
+	// Client Request Count
+	round      int
+	electTimes int
+	currLeader int
+	clientId   int
+	reqCount   int
+	// RBC instance should be committed
+	// If receive all rbc instance and aba stop exit acs instance
+	// Only exit once to avoid channel error
+	rbcsCommit []int
+	recvAllRBC bool
+	abaStop    bool
+	exitted    bool
 	// Used to crypto
 	suite  *bn256.Suite
 	pubKey *share.PubPoly
@@ -69,7 +84,7 @@ type ACS struct {
 	// Done channel to notify consensus
 	// Child Event channel to receive msg from child module
 	// ACS output txs to consensus
-	txsCh     chan [][]byte
+	txsCh     chan *message.InputTx
 	acsInCh   chan *message.ConsensusMsg
 	acsOutCh  chan int
 	acsClear  chan int
@@ -78,10 +93,11 @@ type ACS struct {
 	doneCh    chan bool
 	acsEvent  chan ACSEvent
 	// Child module. e.g. wprbc protocol, pb protocol, elect protocol and aba protocol...
-	wpInstances    []*WPRBC
+	pcInstances    []*PCBC
 	pbInstances    []*PB
 	electInstances []*Elect
 	abaInstances   []*ABA
+	decideInstance *Decide
 }
 
 func MakeAcs(logger *log.Logger,
@@ -98,7 +114,7 @@ func MakeAcs(logger *log.Logger,
 	acs.f = f
 	acs.id = id
 	acs.round = round
-	acs.epoch = 0
+	acs.electTimes = 0
 	acs.suite = suite
 	acs.pubKey = pubKey
 	acs.priKey = priKey
@@ -106,7 +122,7 @@ func MakeAcs(logger *log.Logger,
 	acs.wprbcOuts = make(map[int]message.PROOF)
 	acs.pbOuts = make(map[int]map[int]message.PROOF)
 	acs.seenProofs = make(map[int]message.PROOF)
-	acs.txsCh = make(chan [][]byte, 10)
+	acs.txsCh = make(chan *message.InputTx, 10)
 	acs.acsInCh = make(chan *message.ConsensusMsg, 100)
 	acs.networkCh = make(chan NetworkMsg, 100)
 	acs.stopCh = make(chan bool)
@@ -114,14 +130,14 @@ func MakeAcs(logger *log.Logger,
 	acs.acsEvent = make(chan ACSEvent, acs.n*acs.n)
 	acs.acsOutCh = acsOutCh
 	acs.acsClear = acsClear
-	acs.wpInstances = make([]*WPRBC, acs.n)
+	acs.pcInstances = make([]*PCBC, acs.n)
 	acs.pbInstances = make([]*PB, acs.n)
 	acs.electInstances = make([]*Elect, acs.n)
 	acs.abaInstances = make([]*ABA, acs.n)
 
 	// Init child instances
 	for i := 0; i < acs.n; i++ {
-		acs.wpInstances[i] = MakeWprbc(acs.logger, acs.n, acs.f, acs.id, acs.round, i,
+		acs.pcInstances[i] = MakePCBC(acs.logger, acs.n, acs.f, acs.id, acs.round, i,
 			acs.suite, acs.pubKey, acs.priKey,
 			acs.acsEvent, acs.networkCh)
 		acs.pbInstances[i] = MakePB(acs.logger, acs.n, acs.f, acs.id, acs.round, i,
@@ -134,6 +150,9 @@ func MakeAcs(logger *log.Logger,
 			acs.suite, acs.pubKey, acs.priKey,
 			acs.acsEvent, acs.networkCh)
 	}
+	acs.decideInstance = MakeDecide(acs.logger, acs.n, acs.f, acs.id, acs.round,
+		acs.suite, acs.pubKey,
+		acs.acsEvent)
 
 	go acs.run()
 
@@ -158,40 +177,46 @@ L:
 		}
 	}
 
-	// Wait for all wprbc instances done
+	// Wait for all child instances done
 	for i := 0; i < acs.n; i++ {
-		<-acs.wpInstances[i].Done()
+		<-acs.pcInstances[i].Done()
 		<-acs.pbInstances[i].Done()
 		<-acs.electInstances[i].Done()
 		<-acs.abaInstances[i].Done()
+		acs.logger.Printf("[Round:%d] ACS receive [InstanceId:%d] ABA.\n", acs.round, i)
 	}
+
+	<-acs.decideInstance.Done()
 
 	acs.logger.Printf("[Round:%d] ACS done.\n", acs.round)
 
 	for i := 0; i < acs.n; i++ {
-		acs.wpInstances = nil
+		acs.pcInstances = nil
 		acs.pbInstances = nil
 		acs.electInstances = nil
 		acs.abaInstances = nil
 	}
-
-	acs.logger.Printf("[Round:%d] ACS done.\n", acs.round)
+	acs.decideInstance = nil
+	acs.logger.Printf("[Round:%d] ACS clear.\n", acs.round)
 	// ACS wait for all sub instances done, send a clear signal to consensus
 	acs.acsClear <- acs.round
+	acs.logger.Printf("[Round:%d] acs exit.\n", acs.round)
 }
 
 func (acs *ACS) stopAllInstances() {
 	for i := 0; i < acs.n; i++ {
-		acs.wpInstances[i].Stop()
+		acs.pcInstances[i].Stop()
 		acs.pbInstances[i].Stop()
 		acs.electInstances[i].Stop()
 		acs.abaInstances[i].Stop()
 	}
+	acs.decideInstance.Stop()
+	acs.logger.Printf("[Round:%d] stop all instance.\n", acs.round)
 }
 
-func (acs *ACS) handleTxs(txs [][]byte) {
+func (acs *ACS) handleTxs(txMsg *message.InputTx) {
 	// Marshal
-	txsBytes, err := json.Marshal(txs)
+	txsBytes, err := json.Marshal(txMsg.Transactions)
 	if err != nil {
 		acs.logger.Printf("[Round:%d] txs marshal failed.\n", acs.round)
 		return
@@ -209,10 +234,13 @@ func (acs *ACS) handleTxs(txs [][]byte) {
 		return
 	}
 	rootHash := mt[1]
+	// Assign client id and client request count
+	acs.clientId = txMsg.ClientId
+	acs.reqCount = txMsg.ReqCount
 	for i := 0; i < acs.n; i++ {
 		branch := merkletree.GetMerkleBranch(i, mt)
-		msg := message.GenWPRBCMsg(acs.id, acs.round, acs.id)
-		msg.ConsensusMsgField.WprbcReqField.VALField = &message.VAL{
+		msg := message.GenPCBCMsg(acs.id, acs.round, acs.id)
+		msg.ConsensusMsgField.PCBCReqField.VALField = &message.VAL{
 			RootHash: rootHash,
 			Branch:   branch,
 			Shard:    shards[i],
@@ -227,14 +255,11 @@ func (acs *ACS) handleTxs(txs [][]byte) {
 }
 
 func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
-	if msg.WprbcReqField != nil {
-		acs.wpInstances[msg.WprbcReqField.Proposer].InputValue(msg.WprbcReqField)
+	if msg.PCBCReqField != nil {
+		acs.pcInstances[msg.PCBCReqField.Proposer].InputValue(msg.PCBCReqField)
 	}
 	if msg.PBMsgField != nil {
-		newMap := make(map[int]message.PROOF, acs.n)
-		for k, v := range acs.seenProofs {
-			newMap[k] = v
-		}
+		newMap := acs.mapCopy(acs.seenProofs)
 		acs.pbInstances[msg.PBMsgField.Proposer].InputValue(newMap, msg.PBMsgField)
 	}
 	if msg.ElectMsgField != nil {
@@ -243,53 +268,201 @@ func (acs *ACS) handlemsg(msg *message.ConsensusMsg) {
 	if msg.ABAMsgField != nil {
 		acs.abaInstances[msg.ABAMsgField.InstanceId].InputValue(msg.ABAMsgField)
 	}
+	if msg.DecideMsgField != nil {
+		newMap := acs.mapCopy(acs.seenProofs)
+		acs.decideInstance.InputValue(newMap, msg.DecideMsgField)
+	}
+}
+
+func (acs *ACS) mapCopy(origin map[int]message.PROOF) map[int]message.PROOF {
+	newMap := make(map[int]message.PROOF, len(origin))
+	for k, v := range origin {
+		newMap[k] = v
+	}
+	return newMap
 }
 
 func (acs *ACS) eventHandler(event ACSEvent) {
 	switch event.status {
 	case message.RBCOUTPUT:
-		acs.rbcOuts[event.instanceId] = event.rbcOut
-		acs.logger.Printf("[Round:%d] ACS deliver [%d] rbc instance.\n", acs.round, event.instanceId)
-	case message.WPRBCOUTPUT:
-		if _, ok := acs.wprbcOuts[event.instanceId]; ok {
-			acs.logger.Printf("[Round:%d] ACS has delivered [%d] wprbc instance.\n", acs.round, event.instanceId)
-			return
-		}
-		acs.wprbcOuts[event.instanceId] = event.wprbcOut
-		if len(acs.wprbcOuts) == acs.n-acs.f {
-			acs.pbThreshold()
-		}
-		if _, ok := acs.seenProofs[event.instanceId]; !ok {
-			acs.seenProofs[event.instanceId] = event.wprbcOut
-		}
-		acs.logger.Printf("[Round:%d] ACS deliver [%d] wprbc instance.\n", acs.round, event.instanceId)
+		acs.handleRBCOut(event.instanceId, event.rbcOut)
+	case message.PCBCOUTPUT:
+		acs.handlePCBCOut(event.instanceId, event.pcbcOut)
 	case message.PBOUTPUT:
-		if _, ok := acs.pbOuts[event.instanceId]; ok {
-			acs.logger.Printf("[Round:%d] ACS has delivered [%d] pb instance.\n", acs.round, event.instanceId)
-			return
-		}
-		acs.pbOuts[event.instanceId] = event.pbOut
-		acs.logger.Printf("[Round:%d] ACS deliver [%d] pb instance.\n", acs.round, event.instanceId)
-		if len(acs.pbOuts) == acs.n-acs.f {
-			acs.electThreshold()
-		}
+		acs.handlePBOut(event.instanceId, event.pbOut)
 	case message.ELECTOUTPUT:
-		acs.logger.Printf("[Round:%d] ACS deliver [%d] elect instance.\n", acs.round, event.instanceId)
-		if acs.id%2 == 0 {
-			acs.abaInstances[0].InputEST(1)
-		} else {
-			acs.abaInstances[0].InputEST(0)
-		}
+		acs.handleELECTOut(event.epoch, event.commonLeader)
 	case message.BAOUTPUT:
-		acs.logger.Printf("[Round:%d] [Epoch:%d] ACS receive %d from ABA.\n", acs.round, acs.epoch, event.baOut)
+		acs.handleBAOut(event.instanceId, event.baOut)
 	case message.BASTOP:
-		acs.logger.Printf("[Round:%d] stop ABA.\n", acs.round)
+		acs.handleBAStop(event.instanceId)
+	case message.DECIDE:
+		acs.handleDecide(event.decide)
+	}
+}
+
+func (acs *ACS) handleRBCOut(instanceId int, rbcOut []byte) {
+	acs.rbcOuts[instanceId] = rbcOut
+	acs.logger.Printf("[Round:%d] ACS deliver [%d] rbc instance.\n", acs.round, instanceId)
+	acs.logger.Printf("RBC output = %v.\n", rbcOut)
+
+	if acs.recvAllRBC {
+		return
+	}
+
+	recvAll := true
+	for _, instanceId := range acs.rbcsCommit {
+		if _, ok := acs.rbcOuts[instanceId]; !ok {
+			recvAll = false
+		}
+	}
+
+	if recvAll && acs.abaStop && !acs.exitted {
+		acs.logger.Printf("[Round:%d] acs stop in rbc phase.\n", acs.round)
+		acs.exitted = true
 		select {
 		case <-acs.stopCh:
 			return
 		default:
+			res := message.ClientRes{Round: acs.round, ReqCount: acs.reqCount, PeerId: acs.id}
+			acs.networkCh <- NetworkMsg{clientRes: true, res: res}
 			acs.acsOutCh <- acs.round
 		}
+	}
+}
+
+func (acs *ACS) handlePCBCOut(instanceId int, proof message.PROOF) {
+	// If received wprbc out, return
+	if _, ok := acs.wprbcOuts[instanceId]; ok {
+		acs.logger.Printf("[Round:%d] ACS has delivered [%d] pcbc instance.\n", acs.round, instanceId)
+		return
+	}
+	acs.wprbcOuts[instanceId] = proof
+	// If delivered n-f wprbc instances, participate elect
+	if len(acs.wprbcOuts) == acs.n-acs.f {
+		acs.pbThreshold()
+	}
+	// acs.logger.Printf("[Round:%d] ACS deliver [%d] wprbc instance.\n", acs.round, instanceId)
+}
+
+func (acs *ACS) handlePBOut(instanceId int, proofs map[int]message.PROOF) {
+	if _, ok := acs.pbOuts[instanceId]; ok {
+		// acs.logger.Printf("[Round:%d] ACS has delivered [%d] pb instance.\n", acs.round, instanceId)
+		return
+	}
+	acs.pbOuts[instanceId] = proofs
+	// acs.logger.Printf("[Round:%d] ACS deliver [%d] pb instance.\n", acs.round, instanceId)
+	if len(acs.pbOuts) == acs.n-acs.f {
+		acs.electThreshold()
+	}
+}
+
+func (acs *ACS) handleELECTOut(epoch int, commonLeader int) {
+	acs.logger.Printf("[Round:%d] ACS deliver [electTimes:%d] with [LeaderId:%d].\n", acs.round, epoch, commonLeader)
+	acs.currLeader = commonLeader
+	_, ok := acs.pbOuts[commonLeader]
+	if ok {
+		acs.abaInstances[epoch].InputEST(1)
+	} else {
+		acs.abaInstances[epoch].InputEST(0)
+	}
+}
+
+func (acs *ACS) handleBAOut(instanceId, decide int) {
+	acs.logger.Printf("[Round:%d] [electTimes:%d] ACS receive %d from [ABAInstance:%d].\n", acs.round, acs.electTimes, decide, instanceId)
+	if decide != 1 {
+		acs.electTimes++
+		acs.electThreshold()
+		return
+	}
+
+	notRecv := true
+	if _, ok := acs.pbOuts[acs.currLeader]; ok {
+		notRecv = false
+	}
+	acs.logger.Printf("[Round:%d] [electTimes:%d] not receive [CurrLeader:%d] ? %t.\n", acs.round, acs.electTimes, acs.currLeader, notRecv)
+
+	decideMsg := message.GenDecideMsg(acs.round)
+	decideMsg.ConsensusMsgField.DecideMsgField = &message.DecideMsg{}
+	decideMsg.ConsensusMsgField.DecideMsgField.Leader = acs.currLeader
+	decideMsg.ConsensusMsgField.DecideMsgField.Proposer = acs.id
+	decideMsg.ConsensusMsgField.DecideMsgField.NotRecv = notRecv
+
+	var err error
+	var proofsBytes []byte
+	if !notRecv {
+		proofsBytes, err = json.Marshal(acs.pbOuts[acs.currLeader])
+		if err != nil {
+			acs.logger.Printf("[Round:%d] ACS marshal W_L error.\n", acs.round)
+			acs.logger.Println(err)
+			return
+		}
+	}
+	decideMsg.ConsensusMsgField.DecideMsgField.Proofs = proofsBytes
+	reqMsg := NetworkMsg{broadcast: true, msg: decideMsg}
+
+	select {
+	case <-acs.stopCh:
+		return
+	default:
+		acs.networkCh <- reqMsg
+	}
+}
+
+func (acs *ACS) handleBAStop(instanceId int) {
+	acs.logger.Printf("[Round:%d] [epoch:%d] aba stop.\n", acs.round, instanceId)
+	if instanceId >= acs.electTimes {
+		acs.abaStop = true
+	}
+	acs.logger.Printf("[Round:%d] [epoch:%d] [electTimes:%d].\n", acs.round, instanceId, acs.electTimes)
+	acs.logger.Printf("[Round:%d] receive all rbc instance ? %t.\n", acs.round, acs.recvAllRBC)
+
+	if acs.abaStop && acs.recvAllRBC && !acs.exitted {
+		acs.logger.Printf("[Round:%d] acs stop in aba phase.\n", acs.round)
+		acs.exitted = true
+		select {
+		case <-acs.stopCh:
+			return
+		default:
+			res := message.ClientRes{Round: acs.round, PeerId: acs.id, ReqCount: acs.reqCount}
+			acs.networkCh <- NetworkMsg{clientRes: true, res: res}
+			acs.acsOutCh <- acs.round
+		}
+	}
+}
+
+func (acs *ACS) handleDecide(decide []int) {
+	acs.logger.Printf("[Round:%d] decide rbc instance = %v.\n", acs.round, decide)
+	received := make([]int, 0)
+	for instanceId := range acs.rbcOuts {
+		received = append(received, instanceId)
+	}
+	acs.logger.Printf("[Round:%d] received rbc instance = %v.\n", acs.round, received)
+
+	recvAll := true
+	for _, instanceId := range decide {
+		if _, ok := acs.rbcOuts[instanceId]; !ok {
+			recvAll = false
+		}
+	}
+
+	acs.logger.Printf("[Round:%d] handle decide receive all rbc instance ? %t.\n", acs.round, recvAll)
+
+	acs.recvAllRBC = recvAll
+	// If receive all rbc instances && aba stopped && acs not exit
+	if recvAll && acs.abaStop && !acs.exitted {
+		acs.logger.Printf("[Round:%d] acs stop in decide phase.\n", acs.round)
+		acs.exitted = true
+		select {
+		case <-acs.stopCh:
+			return
+		default:
+			res := message.ClientRes{Round: acs.round, PeerId: acs.id}
+			acs.networkCh <- NetworkMsg{clientRes: true, res: res}
+			acs.acsOutCh <- acs.round
+		}
+	} else {
+		acs.rbcsCommit = decide
 	}
 }
 
@@ -314,8 +487,6 @@ func (acs *ACS) pbThreshold() {
 		Proofs:    proofBytes,
 	}
 
-	acs.logger.Printf("[Round:%d] start pb.\n", acs.round)
-
 	reqMsg := NetworkMsg{broadcast: true, msg: pbReq}
 
 	select {
@@ -328,20 +499,20 @@ func (acs *ACS) pbThreshold() {
 
 // If delivered n-f pb instances, broadcast elect share
 func (acs *ACS) electThreshold() {
-	electData := strconv.Itoa(acs.round) + "-" + strconv.Itoa(acs.epoch)
+	electData := strconv.Itoa(acs.round) + "-" + strconv.Itoa(acs.electTimes)
 	electHash, err := verify.ConvertStructToHashBytes(electData)
 	if err != nil {
-		acs.logger.Printf("[Round:%d] [Epoch:%d] [Peer:%d] generate elect hash failed.\n", acs.round, acs.epoch, acs.id)
+		acs.logger.Printf("[Round:%d] [electTimes:%d] [Peer:%d] generate elect hash failed.\n", acs.round, acs.electTimes, acs.id)
 		return
 	}
 
 	share, err := verify.GenShare(electHash, acs.suite, acs.priKey)
 	if err != nil {
-		acs.logger.Printf("[Round:%d] [Epoch:%d] [Peer:%d] generate elect share failed.\n", acs.round, acs.epoch, acs.id)
+		acs.logger.Printf("[Round:%d] [electTimes:%d] [Peer:%d] generate elect share failed.\n", acs.round, acs.electTimes, acs.id)
 		return
 	}
 
-	electMsg := message.GenElectMsg(acs.round, acs.epoch, acs.id)
+	electMsg := message.GenElectMsg(acs.round, acs.electTimes, acs.id)
 	electMsg.ConsensusMsgField.ElectMsgField.ElectFileld = message.Elect{
 		ElectHash: electHash,
 		Share:     share,
@@ -358,6 +529,11 @@ func (acs *ACS) electThreshold() {
 }
 
 func (acs *ACS) sendToNetwork(reqMsg NetworkMsg) {
+	if reqMsg.clientRes {
+		acs.network.ClientResponse(acs.clientId, reqMsg.res)
+		return
+	}
+
 	if reqMsg.broadcast {
 		acs.network.Broadcast(reqMsg.msg)
 	} else {
@@ -366,8 +542,8 @@ func (acs *ACS) sendToNetwork(reqMsg NetworkMsg) {
 }
 
 // Send transactions to acs
-func (acs *ACS) InputTxs(txs [][]byte) {
-	acs.txsCh <- txs
+func (acs *ACS) InputTxs(txMsg *message.InputTx) {
+	acs.txsCh <- txMsg
 }
 
 // Send data to acs channel

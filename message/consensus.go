@@ -6,6 +6,8 @@ type ConsensusConfig struct {
 
 type InputTx struct {
 	Transactions [][]byte
+	ClientId     int
+	ReqCount     int
 }
 
 type ConsensusMsg struct {
@@ -13,10 +15,11 @@ type ConsensusMsg struct {
 	Round                int
 	ConsensusConfigField *ConsensusConfig
 	InputTxField         *InputTx
-	WprbcReqField        *WprbcReq
+	PCBCReqField         *PCBCReq
 	PBMsgField           *PBMsg
 	ElectMsgField        *ElectMsg
 	ABAMsgField          *ABAMsg
+	DecideMsgField       *DecideMsg
 }
 
 // Consensus message generator

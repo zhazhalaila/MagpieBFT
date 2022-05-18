@@ -20,13 +20,12 @@ type Elect struct {
 	// N(total peers number) F(byzantine peers number) Id(peer identify)
 	// Round (Create PB instance round)
 	// Epoch (One election maybe not enough)
-	n         int
-	f         int
-	id        int
-	round     int
-	epoch     int
-	shares    map[int][]byte
-	siganture []byte
+	n      int
+	f      int
+	id     int
+	round  int
+	epoch  int
+	shares map[int][]byte
 	// Used to crypto
 	suite  *bn256.Suite
 	pubKey *share.PubPoly
@@ -135,7 +134,7 @@ func (e *Elect) electHandler(elec message.Elect, sender int) {
 		case <-e.stopCh:
 			return
 		default:
-			e.acsEvent <- ACSEvent{status: message.ELECTOUTPUT, commonLeader: int(leaderHash[0]) % e.n}
+			e.acsEvent <- ACSEvent{status: message.ELECTOUTPUT, commonLeader: int(leaderHash[0]) % e.n, epoch: e.epoch}
 		}
 	} else {
 		e.mu.Unlock()

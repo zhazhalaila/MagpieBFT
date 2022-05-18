@@ -3,7 +3,7 @@ package libclient
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,20 +13,19 @@ import (
 	"github.com/zhazhalaila/BFTProtocol/message"
 )
 
-type RemotePeer struct {
+type remotePeer struct {
 	// Recode peer connection
-	Conn     net.Conn
-	Sender   *json.Encoder
-	Receiver *json.Decoder
+	conn     net.Conn
+	sender   *json.Encoder
+	receiver *json.Decoder
 }
 
-type Request struct {
-	// Consensus time = startTime - endTime
+type request struct {
+	// Elapsed time = time.Now() - startTime
 	// ReplyPeers = f+1 response from consensus cluster
-	StartTime  time.Time
-	EndTime    time.Duration
-	ReplyPeers []int
-	Done       chan bool
+	startTime   time.Time
+	elapsedTime time.Duration
+	replyPeers  []int
 }
 
 type Client struct {
@@ -35,47 +34,62 @@ type Client struct {
 	n  int
 	f  int
 	// Client identify
+	// Request count
+	// Batch size
 	// Remote peer address
-	id       int
-	addrs    []string
-	peers    map[int]RemotePeer
-	requests map[int]Request
+	id        int
+	reqCount  int
+	batchSize int
+	addrs     []string
+	peers     map[int]remotePeer
+	reqs      map[int]*request
+	waiter    chan int
+	done      chan bool
 }
 
 // Create new client
-func NewClient(n, f, id int) *Client {
+func NewClient(n, f, id, reqCount, batchSize int) *Client {
 	c := &Client{}
 	c.n = n
 	c.f = f
 	c.id = id
+	c.reqCount = reqCount
+	c.batchSize = batchSize
 	c.addrs = make([]string, c.n)
-	c.peers = make(map[int]RemotePeer)
-	c.requests = make(map[int]Request)
+	c.peers = make(map[int]remotePeer)
+	c.reqs = make(map[int]*request, reqCount)
+	c.waiter = make(chan int, c.reqCount)
+	c.done = make(chan bool)
+
+	// Init req
+	for i := 0; i < c.reqCount; i++ {
+		c.reqs[i] = &request{}
+		c.reqs[i].replyPeers = make([]int, 0)
+	}
+
+	go c.wait()
 	return c
 }
 
+// Send txs to consensus node
 func (c *Client) SendRequest() {
-	txs := make([][]byte, c.n)
-	for i := 0; i < c.n; i++ {
-		txs[i] = make([]byte, c.n)
-		for j := 0; j < c.n; j++ {
-			txs[i][j] = byte(i)
-		}
-	}
-
-	fmt.Println(txs)
-
-	for i := 0; i < c.n; i++ {
-		subTxs := make([][]byte, 1)
-		subTxs[0] = txs[i]
-		req := message.ReqMsg{
-			ConsensusMsgField: &message.ConsensusMsg{
-				InputTxField: &message.InputTx{
-					Transactions: subTxs,
+	for req := 0; req < c.reqCount; req++ {
+		for i := 0; i < c.n; i++ {
+			txs := message.FakeBatchTx(c.batchSize, c.id, c.reqCount, i)
+			req := message.ReqMsg{
+				ConsensusMsgField: &message.ConsensusMsg{
+					InputTxField: &message.InputTx{
+						Transactions: txs,
+						ClientId:     c.id,
+						ReqCount:     req,
+					},
 				},
-			},
+			}
+			log.Println(txs)
+			c.sendMsg(c.peers[i].sender, req)
 		}
-		c.sendMsg(c.peers[i].Sender, req)
+		c.reqs[req].startTime = time.Now()
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -112,10 +126,10 @@ func (c *Client) ConnectRemotePeers() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		c.peers[i] = RemotePeer{
-			Conn:     conn,
-			Sender:   json.NewEncoder(conn),
-			Receiver: json.NewDecoder(conn),
+		c.peers[i] = remotePeer{
+			conn:     conn,
+			sender:   json.NewEncoder(conn),
+			receiver: json.NewDecoder(conn),
 		}
 		// Construct client message
 		msg := message.ReqMsg{
@@ -126,7 +140,7 @@ func (c *Client) ConnectRemotePeers() {
 			},
 		}
 		// Send client message
-		c.sendMsg(c.peers[i].Sender, msg)
+		c.sendMsg(c.peers[i].sender, msg)
 	}
 }
 
@@ -134,19 +148,97 @@ func (c *Client) ConnectRemotePeers() {
 func (c *Client) PeersConnectPeers() {
 	for i := 0; i < c.n; i++ {
 		for j := 0; j < c.n; j++ {
-			connMsg := message.ReqMsg{
-				NetworkMangeField: &message.NetworkMange{
-					ConnPeerField: &message.ConnectPeer{
-						PeerAddr: c.addrs[j],
-						PeerId:   j,
-					},
-				},
+			connMsg := message.GenNetMangeMsg()
+			connMsg.NetworkMangeField.ConnPeerField = &message.ConnectPeer{
+				PeerAddr: c.addrs[j],
+				PeerId:   j,
 			}
-			c.sendMsg(c.peers[i].Sender, connMsg)
+			c.sendMsg(c.peers[i].sender, connMsg)
 		}
+	}
+
+	c.recvMsg()
+}
+
+func (c *Client) Done() <-chan bool {
+	return c.done
+}
+
+// Compute latency
+func (c *Client) ComputeLatency() {
+	var totalTime int64
+	for i := 0; i < c.reqCount; i++ {
+		totalTime += c.reqs[i].elapsedTime.Milliseconds()
+	}
+	log.Printf("BFT protocol consensus [%d] times within [%d] milliseconds.\n", c.reqCount, totalTime)
+	log.Printf("[N=%d, F=%d, BatchSize=%d] BFT protocol need [%d]milliseconds to consens for a request.\n",
+		c.n, c.f, c.batchSize, totalTime/int64(c.reqCount))
+}
+
+// Disconnect from remote peer
+func (c *Client) Disconnect() {
+	for i := 0; i < c.n; i++ {
+		disConnMsg := message.GenNetMangeMsg()
+		disConnMsg.NetworkMangeField.DisconnectClientField = &message.DisconnectClient{
+			ClientId: c.id,
+		}
+		c.sendMsg(c.peers[i].sender, disConnMsg)
+	}
+
+	for i := 0; i < c.n; i++ {
+		c.peers[i].conn.Close()
 	}
 }
 
+// Wait for all requests receive 2f+1 response.
+func (c *Client) wait() {
+	for i := 0; i < c.reqCount; i++ {
+		<-c.waiter
+	}
+	c.done <- true
+}
+
+// Create goroutine to handle peers' response
+func (c *Client) recvMsg() {
+	for peerId := range c.peers {
+		go func(peerId int) {
+			defer func() {
+				c.mu.Lock()
+				delete(c.peers, peerId)
+				log.Printf("[Peer:%d] close connection.\n", peerId)
+				c.mu.Unlock()
+			}()
+
+			for {
+				var resMsg message.ClientRes
+				if err := c.peers[peerId].receiver.Decode(&resMsg); err == io.EOF {
+					break
+				} else if err != nil {
+					log.Println(err)
+					break
+				}
+				log.Printf("[{Round:%d} {ReqCount:%d}] receive [PeerId:%d] response.\n", resMsg.Round, resMsg.ReqCount, resMsg.PeerId)
+				c.resHandler(resMsg.ReqCount, resMsg.PeerId)
+			}
+		}(peerId)
+	}
+}
+
+// Using lock to prevent data race.
+func (c *Client) resHandler(reqCount int, peerId int) {
+	c.mu.Lock()
+	c.reqs[reqCount].replyPeers = append(c.reqs[reqCount].replyPeers, peerId)
+	if len(c.reqs[reqCount].replyPeers) == 2*c.f+1 {
+		c.reqs[reqCount].elapsedTime = time.Since(c.reqs[reqCount].startTime)
+		c.mu.Unlock()
+		log.Println("Send channel")
+		c.waiter <- reqCount
+	} else {
+		c.mu.Unlock()
+	}
+}
+
+// Send message to remote peer.
 func (c *Client) sendMsg(sender *json.Encoder, msg message.ReqMsg) {
 	err := sender.Encode(msg)
 	if err != nil {

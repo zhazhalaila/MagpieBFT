@@ -28,3 +28,11 @@ type NetworkMange struct {
 	SetClientField        *SetClient
 	DisconnectClientField *DisconnectClient
 }
+
+// Generate network manage message
+func GenNetMangeMsg() ReqMsg {
+	netMangeMsg := ReqMsg{
+		NetworkMangeField: &NetworkMange{},
+	}
+	return netMangeMsg
+}

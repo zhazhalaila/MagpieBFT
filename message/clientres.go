@@ -3,8 +3,9 @@ package message
 type ClientRes struct {
 	// Consensus round
 	Round int
-	// Who has compleyed consensus for client request
-	PeerId   int
+	// Request count
 	ReqCount int
-	Results  []byte
+	// Who has compleyed consensus for client request
+	PeerId  int
+	Results []byte
 }
